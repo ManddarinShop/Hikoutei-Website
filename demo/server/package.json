@@ -9,7 +9,7 @@
     "start": "tsx src/server.ts"
   },
   "dependencies": {
-    "@mikro-orm/core": "7.1.7",
+    "@mikro-orm/core": "7.1.15",
     "@mikro-orm/sql": "7.1.7",
     "express": "^4.19.0",
     "hikoutei": "0.10.19-dev"
