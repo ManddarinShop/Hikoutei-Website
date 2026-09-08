@@ -1,0 +1,12 @@
+# Deps and build output.
+node_modules/
+.vitepress/dist/
+.vitepress/cache/
+
+# Demo runtime state (SQLite + injected secrets). The SA key travels as
+# DEMO_SA_JSON via CI secrets and must never be committed.
+demo/deploy/secrets/
+*.sqlite
+*.sqlite-*
+.env
+demo/data/

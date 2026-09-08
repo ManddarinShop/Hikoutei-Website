@@ -1,0 +1,17 @@
+# Demo dependency bumps (replaces the monorepo's demo-pin-bump workflow).
+#
+# The demo server pins an exact `hikoutei` release; Dependabot opens a PR
+# whenever npm carries a newer one. Merging the PR deploys it: the push
+# matches demo-deploy's path filter (`demo/**`). Human merge = human
+# deploy approval; no surprise production deploys.
+
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /demo/server
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore(demo)
+    labels:
+      - dependencies
