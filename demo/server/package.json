@@ -12,7 +12,7 @@
     "@mikro-orm/core": "7.1.7",
     "@mikro-orm/sql": "7.1.7",
     "express": "^4.19.0",
-    "hikoutei": "0.9.28"
+    "hikoutei": "0.10.19-dev"
   },
   "devDependencies": {
     "@types/express": "^4.17.21",
