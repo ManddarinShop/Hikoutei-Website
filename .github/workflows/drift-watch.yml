@@ -38,14 +38,22 @@ jobs:
 
             echo "--- containers ---"
             docker ps --format '{{.Names}} {{.Status}}'
-            for c in deploy-caddy-1 deploy-demo-server-1; do
-              if docker ps --format '{{.Names}}' | grep -qx "$c"; then
-                echo "ok: container $c running"
-              else
-                echo "DRIFT: container $c missing"
-                fail=1
-              fi
-            done
+            # Project name drifts with the checkout layout (deploy-* vs
+            # bare), so match either generation and reuse the names below.
+            caddy=$(docker ps --format '{{.Names}}' | grep -E '^(deploy-)?caddy-1$' | head -1 || true)
+            server=$(docker ps --format '{{.Names}}' | grep -E '^(deploy-)?demo-server-1$' | head -1 || true)
+            if [ -n "$caddy" ]; then
+              echo "ok: caddy $caddy running"
+            else
+              echo "DRIFT: caddy container missing"
+              fail=1
+            fi
+            if [ -n "$server" ]; then
+              echo "ok: demo-server $server running"
+            else
+              echo "DRIFT: demo-server container missing"
+              fail=1
+            fi
 
             echo "--- k3s ---"
             if systemctl is-active --quiet k3s 2>/dev/null; then
@@ -79,7 +87,9 @@ jobs:
 
             if [ "$fail" -ne 0 ]; then
               echo "=== context: caddy tail ==="
-              docker logs deploy-caddy-1 --tail 5 2>&1 || true
+              if [ -n "$caddy" ]; then docker logs "$caddy" --tail 5 2>&1 || true; fi
+              echo "=== context: demo-server tail (crash reason) ==="
+              if [ -n "$server" ]; then docker logs "$server" --tail 15 2>&1 || true; fi
               exit 1
             fi
             echo "drift check clean"
