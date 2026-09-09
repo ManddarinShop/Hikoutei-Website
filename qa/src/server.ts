@@ -18,7 +18,17 @@
  */
 
 import { createServer } from "node:http";
-import { createTypedSheets, defineTypedSheetsEntity } from "hikoutei";
+import { createTypedSheets } from "hikoutei";
+import { QARecord, type ExpectedRow, type ModelMirror } from "./entity.ts";
+import {
+  assertCount,
+  assertRows,
+  createRow,
+  deleteRow,
+  flushCycle,
+  updateRow,
+  type NewRow,
+} from "./minops.ts";
 
 const QA_PORT = Number(process.env.QA_PORT ?? 3201);
 const QA_DB_PATH = process.env.QA_DB_PATH ?? "./qa.sqlite";
@@ -47,25 +57,8 @@ function mulberry32(seed: number): () => number {
 
 const rng = mulberry32(SEED);
 
-const QARecord = defineTypedSheetsEntity({
-  name: "QARecord",
-  tableName: "qa_records",
-  properties: {
-    id: { type: "string", primary: true },
-    name: { type: "string" },
-    amount: { type: "number" },
-    processed: { type: "boolean" },
-  },
-});
-
-interface ExpectedRow {
-  readonly name: string;
-  readonly amount: number;
-  readonly processed: boolean;
-}
-
 /** The model mirror: every row the runtime must hold, by id. */
-const model = new Map<string, ExpectedRow>();
+const model: ModelMirror = new Map<string, ExpectedRow>();
 
 interface FailureReport {
   readonly seed: number;
@@ -119,44 +112,25 @@ console.log("[qa] runtime ready (local-only)");
 // ---------------------------------------------------------------------------
 
 async function opCreate(count: number): Promise<string[]> {
-  const em = hikoutei.em.fork();
-  const ids: string[] = [];
+  const rows: NewRow[] = [];
   for (let i = 0; i < count; i += 1) {
     const id = `qa_${SEED.toString(36)}_${idCounter++}`;
-    const row = randomRow();
-    em.persist(em.create(QARecord, { id, ...row }));
-    model.set(id, row);
-    ids.push(id);
+    rows.push({ id, ...randomRow() });
   }
-  await em.flush();
-  return ids;
+  return createRow(hikoutei, model, rows);
 }
 
 async function opUpdate(id: string): Promise<void> {
-  const em = hikoutei.em.fork();
-  const entity = await em.findOne(QARecord, { id });
-  if (entity === null) throw new Error(`update target missing: ${id}`);
-  const row = randomRow();
-  entity.name = row.name;
-  entity.amount = row.amount;
-  entity.processed = row.processed;
-  await em.flush();
-  model.set(id, row);
+  await updateRow(hikoutei, model, id, randomRow());
 }
 
 async function opDelete(id: string): Promise<void> {
-  const em = hikoutei.em.fork();
-  const entity = await em.findOne(QARecord, { id });
-  if (entity === null) throw new Error(`delete target missing: ${id}`);
-  em.remove(entity);
-  await em.flush();
-  model.delete(id);
+  await deleteRow(hikoutei, model, id);
 }
 
 /** Empty flush plus count check: exercises the no-op write path. */
 async function opFlushCycle(): Promise<void> {
-  const em = hikoutei.em.fork();
-  await em.flush();
+  await flushCycle(hikoutei);
 }
 
 /**
@@ -176,8 +150,8 @@ async function opDuplicateInsert(id: string, stepNo: number): Promise<void> {
   if (!rejected) {
     throw new Error(`duplicate insert accepted for ${id} at step ${stepNo} (expected rejection)`);
   }
-  await assertCount(stepNo);
-  await assertReadYourWrites([id], stepNo);
+  await assertCount(hikoutei, model, stepNo);
+  await assertRows(hikoutei, model, [id], stepNo);
 }
 
 /**
@@ -187,66 +161,25 @@ async function opDuplicateInsert(id: string, stepNo: number): Promise<void> {
 async function opNoOpUpdate(id: string, stepNo: number): Promise<void> {
   const expected = model.get(id);
   if (expected === undefined) throw new Error(`no-op target missing: ${id}`);
-  const em = hikoutei.em.fork();
-  const entity = await em.findOne(QARecord, { id });
-  if (entity === null) throw new Error(`no-op target missing: ${id}`);
-  entity.name = expected.name;
-  entity.amount = expected.amount;
-  entity.processed = expected.processed;
-  await em.flush();
-  await assertCount(stepNo);
-  await assertReadYourWrites([id], stepNo);
+  await updateRow(hikoutei, model, id, expected);
+  await assertCount(hikoutei, model, stepNo);
+  await assertRows(hikoutei, model, [id], stepNo);
 }
 
 /**
  * Delete then re-create the same id with new values (mirrors the
  * delete-recreate family): the old row must vanish, the new one must read
- * back exactly.
+ * back exactly. Composed from minimum ops.
  */
 async function opDeleteRecreate(id: string, stepNo: number): Promise<void> {
-  await opDelete(id);
+  await deleteRow(hikoutei, model, id);
   const em = hikoutei.em.fork();
   if (await em.findOne(QARecord, { id }) !== null) {
     throw new Error(`deleted row ${id} still visible at step ${stepNo}`);
   }
   const row = randomRow();
-  const em2 = hikoutei.em.fork();
-  em2.persist(em2.create(QARecord, { id, ...row }));
-  await em2.flush();
-  model.set(id, row);
-  await assertReadYourWrites([id], stepNo);
-}
-
-// ---------------------------------------------------------------------------
-// Oracle: runtime must equal the model after every step
-// ---------------------------------------------------------------------------
-
-async function assertCount(step: number): Promise<void> {
-  const em = hikoutei.em.fork();
-  const total = await em.count(QARecord);
-  if (total !== model.size) {
-    throw new Error(`count drift at step ${step}: runtime=${total} model=${model.size}`);
-  }
-}
-
-async function assertReadYourWrites(ids: readonly string[], step: number): Promise<void> {
-  const em = hikoutei.em.fork();
-  for (const id of ids) {
-    const expected = model.get(id);
-    const found = await em.findOne(QARecord, { id });
-    if (expected === undefined) {
-      if (found !== null) throw new Error(`ghost row ${id} at step ${step}`);
-      continue;
-    }
-    if (found === null) throw new Error(`missing row ${id} at step ${step}`);
-    if (found.name !== expected.name || found.amount !== expected.amount || found.processed !== expected.processed) {
-      throw new Error(
-        `value drift on ${id} at step ${step}: ` +
-        `runtime=(${found.name},${found.amount},${found.processed}) ` +
-        `model=(${expected.name},${expected.amount},${expected.processed})`,
-      );
-    }
-  }
+  await createRow(hikoutei, model, [{ id, ...row }]);
+  await assertRows(hikoutei, model, [id], stepNo);
 }
 
 /** One scheduled step: random op, then the oracle. Never throws. */
@@ -263,11 +196,11 @@ async function step(): Promise<void> {
       // Cap the mirror: evict a random row before growing past the limit.
       if (model.size >= MODEL_ROW_LIMIT) await opDelete(pick(ids));
       const created = await opCreate(1 + Math.floor(rng() * 3));
-      await assertReadYourWrites(created, stepNo);
+      await assertRows(hikoutei, model, created, stepNo);
     } else if (roll < 0.5) {
       const id = pick(ids);
       await opUpdate(id);
-      await assertReadYourWrites([id], stepNo);
+      await assertRows(hikoutei, model, [id], stepNo);
     } else if (roll < 0.65) {
       await opDelete(pick(ids));
     } else if (roll < 0.75) {
@@ -279,7 +212,7 @@ async function step(): Promise<void> {
     } else {
       await opFlushCycle();
     }
-    await assertCount(stepNo);
+    await assertCount(hikoutei, model, stepNo);
   } catch (error) {
     recordFailure(stepNo, "step", error);
   } finally {
