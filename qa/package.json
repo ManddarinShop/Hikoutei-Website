@@ -14,7 +14,8 @@
   "dependencies": {
     "hikoutei": "0.10.19-dev",
     "@mikro-orm/core": "7.1.7",
-    "@mikro-orm/sql": "7.1.7"
+    "@mikro-orm/sql": "7.1.7",
+    "google-auth-library": "^11.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
