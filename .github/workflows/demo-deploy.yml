@@ -62,11 +62,14 @@ jobs:
           REF: ${{ github.ref_name }}
           DEMO_SA_JSON: ${{ secrets.DEMO_SA_JSON }}
           DEMO_ENV: ${{ secrets.DEMO_ENV }}
+          # QA reuses the demo SA key (quota shared); only the sheet differs.
+          QA_SYNC_SPREADSHEET_URL: ${{ secrets.QA_SYNC_SPREADSHEET_URL }}
+          QA_SA_JSON: ${{ secrets.DEMO_SA_JSON }}
         with:
           host: ${{ secrets.DEMO_SSH_HOST }}
           username: ${{ secrets.DEMO_SSH_USER }}
           key: ${{ secrets.DEMO_SSH_KEY }}
-          envs: REF,DEMO_SA_JSON,DEMO_ENV
+          envs: REF,DEMO_SA_JSON,DEMO_ENV,QA_SYNC_SPREADSHEET_URL,QA_SA_JSON
           script: |
             set -euo pipefail
             if [ ! -d /opt/hikoutei-website/.git ]; then
