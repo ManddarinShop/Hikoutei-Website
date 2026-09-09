@@ -35,3 +35,10 @@ Required secrets: `DEMO_SSH_HOST`, `DEMO_SSH_USER`, `DEMO_SSH_KEY`,
 `DEMO_SA_JSON`, `DEMO_ENV` (same set as the former monorepo workflow).
 
 Dependency bumps arrive as Dependabot PRs; merging one deploys it.
+
+## QA harness
+
+Seeded local-only scenario fuzzing (`qa/`, image `hikoutei-qa`) runs
+beside the demo (memory-capped, ephemeral DB, no secrets). Health:
+`docker exec deploy-caddy-1 wget -qO- http://qa:3201/api/qa-health`.
+Replay a failure with the logged seed via `QA_SEED=<seed>`.

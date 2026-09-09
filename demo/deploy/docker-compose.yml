@@ -1,4 +1,5 @@
-# Demo VM stack: demo server (node/hikoutei) + Caddy (static docs + API proxy).
+# Demo VM stack: demo server (node/hikoutei) + Caddy (static docs + API proxy)
+# + QA harness (seeded local-only scenario fuzzing, ephemeral DB).
 #
 # Deployed by .github/workflows/demo-deploy.yml:
 #   - secrets injected to /etc/hikoutei-demo.env + /etc/hikoutei-demo/sa.json
@@ -16,6 +17,20 @@ services:
       - "3101"
     volumes:
       - demo-data:/data
+    networks: [demo]
+
+  qa:
+    build: ../../qa
+    image: hikoutei-qa
+    restart: unless-stopped
+    # Local-only fuzzing needs no secrets and no volumes (ephemeral DB).
+    # Memory-capped so a fuzz-found blowup cannot starve the demo.
+    mem_limit: 768m
+    environment:
+      QA_PORT: 3201
+      QA_TICK_MS: 5000
+    expose:
+      - "3201"
     networks: [demo]
 
   caddy:
