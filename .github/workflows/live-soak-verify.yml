@@ -55,12 +55,11 @@ jobs:
             # the ephemeral-DB replay guarantee.
             docker compose -f demo/deploy/docker-compose.yml up -d --build qa >/dev/null 2>&1
             QIMG=$(docker inspect --format '{{.Config.Image}}' $(docker ps -aq --filter "name=qa" | head -1))
-            # The SA key travels via env (demo.env holds it as a single
-            # minified line). docker --env-file mangles it, so write a
-            # dedicated key file and point GOOGLE_APPLICATION_CREDENTIALS at
-            # it — same auth shape the demo server uses.
+            # Key material: docker run --env-file strips JSON quotes on some
+            # shells (compose env_file does not — that's why the demo works).
+            # Write a key FILE and point GOOGLE_APPLICATION_CREDENTIALS at it
+            # — the same auth shape the demo server uses.
             docker run --rm \
-              --env-file demo/deploy/secrets/demo.env \
               -e HIKOUTEI_SYNC_SPREADSHEET_URL="$HIKOUTEI_SYNC_SPREADSHEET_URL" \
               -e GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa.json \
               -v /tmp/qa-sa/sa.json:/tmp/sa.json:ro \
