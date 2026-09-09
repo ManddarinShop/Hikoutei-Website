@@ -11,6 +11,11 @@ hikoutei.cloud {
 	# Bare host root -> live demo
 	redir / /demo 302
 
+	# QA harness health (must precede /api/*: first matching handle wins)
+	handle /api/qa-health {
+		reverse_proxy qa:3201
+	}
+
 	# Demo backend (SSE: Caddy streams responses without buffering)
 	handle /api/* {
 		reverse_proxy demo-server:3101
