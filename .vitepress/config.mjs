@@ -172,6 +172,10 @@ export default defineConfig({
           { text: "Google Sheets setup", link: "/guide/setup" },
           { text: "Architecture", link: "/guide/architecture" },
           { text: "Write and synchronization flow", link: "/guide/sync-flow" },
+          {
+            text: "Pipeline 3-layer contract",
+            link: "/guide/pipeline-contract",
+          },
           { text: "Public type reference", link: "/guide/type-reference" },
           {
             text: "Internal consistency model",
