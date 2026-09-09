@@ -44,10 +44,13 @@ jobs:
           script: |
             set -euo pipefail
             cd /opt/hikoutei-website
-            # Source the demo env for the sheet URL + SA key (QA reuses both).
-            set -a; source demo/deploy/secrets/demo.env; set +a
-            export HIKOUTEI_SYNC_SPREADSHEET_URL="$HIKOUTEI_SYNC_SPREADSHEET_URL"
-            mkdir -p /tmp/qa-sa && printf '%s' "$DEMO_SA_JSON" > /tmp/qa-sa/sa.json
+            # Extract values WITHOUT sourcing: bash `source` strips the JSON
+            # double quotes (VM bash 5.2 test-confirmed) and an unquoted
+            # SA JSON is invalid. sed reads the raw line bytes.
+            export HIKOUTEI_SYNC_SPREADSHEET_URL=$(sed -n 's/^HIKOUTEI_SYNC_SPREADSHEET_URL=//p' demo/deploy/secrets/demo.env)
+            mkdir -p /tmp/qa-sa
+            sed -n 's/^DEMO_SA_JSON=//p' demo/deploy/secrets/demo.env > /tmp/qa-sa/sa.json
+            python3 -m json.tool /tmp/qa-sa/sa.json > /dev/null
             export GOOGLE_APPLICATION_CREDENTIALS=/tmp/qa-sa/sa.json
 
             # Run the vendored engine inside the qa image (node + deps live
@@ -61,7 +64,6 @@ jobs:
             # — the same auth shape the demo server uses.
             docker run --rm \
               -e HIKOUTEI_SYNC_SPREADSHEET_URL="$HIKOUTEI_SYNC_SPREADSHEET_URL" \
-              -e GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa.json \
               -v /tmp/qa-sa/sa.json:/tmp/sa.json:ro \
               -v /tmp/live-verify:/tmp/live-verify \
               --entrypoint node "$QIMG" \
