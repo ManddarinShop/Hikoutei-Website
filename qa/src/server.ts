@@ -18,6 +18,7 @@
  */
 
 import { createServer } from "node:http";
+import { writeFileSync } from "node:fs";
 import { createTypedSheets } from "hikoutei";
 import { QARecord, type ExpectedRow, type ModelMirror } from "./entity.ts";
 import {
@@ -98,14 +99,32 @@ function randomRow(): ExpectedRow {
 let idCounter = 0;
 
 // ---------------------------------------------------------------------------
-// Runtime (local-only: no sync env, so no credentials or quota needed)
+// Runtime: sync when a QA sheet is configured, local otherwise.
+//
+// Sync mode needs QA_SYNC_SPREADSHEET_URL + QA_SA_JSON (a QA-ONLY sheet —
+// never the demo sheet; the SA key is shared with demo). The key is
+// (re)materialized AND exported on every boot (never skip on existing
+// file: restarts keep /tmp but lose process env — the #509 loop).
 // ---------------------------------------------------------------------------
+
+const qaSyncUrl = (process.env.QA_SYNC_SPREADSHEET_URL ?? "").trim();
+const qaSaJson = process.env.QA_SA_JSON ?? "";
+const syncEnabled = qaSyncUrl !== "" && qaSaJson !== "";
+if (qaSyncUrl !== "" && qaSaJson === "") {
+  throw new Error("QA_SYNC_SPREADSHEET_URL is set but QA_SA_JSON is missing");
+}
+if (syncEnabled) {
+  const saKeyFile = "/tmp/qa-sa.json";
+  writeFileSync(saKeyFile, qaSaJson, { mode: 0o600 });
+  process.env.HIKOUTEI_SYNC_SPREADSHEET_URL = qaSyncUrl;
+  process.env.GOOGLE_APPLICATION_CREDENTIALS = saKeyFile;
+}
 
 const hikoutei = await createTypedSheets({
   dbName: QA_DB_PATH,
   entities: [QARecord],
 });
-console.log("[qa] runtime ready (local-only)");
+console.log(`[qa] runtime ready (sync: ${syncEnabled ? "on" : "off"})`);
 
 // ---------------------------------------------------------------------------
 // Ops: each mutates runtime + model identically, then flushes
@@ -230,6 +249,7 @@ const app = createServer((req, res) => {
     res.end(JSON.stringify({
       ok: failures.length === 0,
       seed: SEED,
+      syncMode: syncEnabled ? "sync" : "local",
       iterations,
       failures: failures.length,
       lastFailure: failures.at(-1) ?? null,

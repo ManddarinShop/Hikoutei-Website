@@ -29,6 +29,8 @@ services:
     environment:
       QA_PORT: 3201
       QA_TICK_MS: 5000
+      QA_SYNC_SPREADSHEET_URL: ${QA_SYNC_SPREADSHEET_URL:-}
+      QA_SA_JSON: ${QA_SA_JSON:-}
     expose:
       - "3201"
     networks: [demo]
