@@ -42,6 +42,7 @@ jobs:
             # bare), so match either generation and reuse the names below.
             caddy=$(docker ps --format '{{.Names}}' | grep -E '^(deploy-)?caddy-1$' | head -1 || true)
             server=$(docker ps --format '{{.Names}}' | grep -E '^(deploy-)?demo-server-1$' | head -1 || true)
+            qa=$(docker ps --format '{{.Names}}' | grep -E '^(deploy-)?qa-1$' | head -1 || true)
             if [ -n "$caddy" ]; then
               echo "ok: caddy $caddy running"
             else
@@ -52,6 +53,12 @@ jobs:
               echo "ok: demo-server $server running"
             else
               echo "DRIFT: demo-server container missing"
+              fail=1
+            fi
+            if [ -n "$qa" ]; then
+              echo "ok: qa $qa running"
+            else
+              echo "DRIFT: qa container missing"
               fail=1
             fi
 
@@ -90,6 +97,8 @@ jobs:
               if [ -n "$caddy" ]; then docker logs "$caddy" --tail 5 2>&1 || true; fi
               echo "=== context: demo-server tail (crash reason) ==="
               if [ -n "$server" ]; then docker logs "$server" --tail 15 2>&1 || true; fi
+              echo "=== context: qa tail ==="
+              if [ -n "$qa" ]; then docker logs "$qa" --tail 8 2>&1 || true; fi
               exit 1
             fi
             echo "drift check clean"
