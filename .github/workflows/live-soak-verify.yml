@@ -54,6 +54,19 @@ jobs:
             python3 -m json.tool /tmp/qa-sa/sa.json > /dev/null
             export GOOGLE_APPLICATION_CREDENTIALS=/tmp/qa-sa/sa.json
 
+            # Clean-slate: remove leftover soak tabs from previous runs so the
+            # verification run composes against a fresh sheet (run-to-run
+            # residue was the failure source in the 0.3h run).
+            docker compose -f demo/deploy/docker-compose.yml up -d --build qa >/dev/null 2>&1
+            QIMG=$(docker inspect --format '{{.Config.Image}}' $(docker ps -aq --filter "name=qa" | head -1))
+            docker run --rm \
+              -e HIKOUTEI_SYNC_SPREADSHEET_URL="$HIKOUTEI_SYNC_SPREADSHEET_URL" \
+              -e GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa.json \
+              -v /tmp/qa-sa/sa.json:/tmp/sa.json:ro \
+              --entrypoint node "$QIMG" \
+              vendor/run-local-multitable-soak.mjs \
+              --cleanup-only 2>&1 | tail -8
+
             # Run the vendored engine inside the qa image (node + deps live
             # there; the VM host has no npm). A fresh container per run keeps
             # the ephemeral-DB replay guarantee.
