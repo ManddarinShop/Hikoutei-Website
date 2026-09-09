@@ -96,6 +96,13 @@ jobs:
             chmod 600 demo/deploy/secrets/demo.env
             rm -f demo/deploy/secrets/sa.json
 
+            # QA env (separate file — docker compose ${VAR} interpolation for
+            # the qa service's environment block reads THIS shell's exported
+            # vars at `up` time, so QA_SA_JSON must be EXPORTED here, not
+            # only present in demo.env. Same key as demo (quota shared).
+            export QA_SA_JSON="$MIN_JSON"
+            export QA_SYNC_SPREADSHEET_URL="${QA_SYNC_SPREADSHEET_URL:-}"
+
             # Swap static docs in place (keep the directory inode — the
             # running caddy container holds the bind mount).
             mkdir -p demo/deploy/docs-dist
