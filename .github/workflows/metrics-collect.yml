@@ -1,0 +1,90 @@
+# Daily ops metrics (committed CSV, no backend).
+#
+# Appends one row per day — public health numbers plus the SQLite size from
+# the host — to ops/metrics.csv, so trends (uptime resets, request failures,
+# DB growth) are visible as repo history instead of someone's memory. This
+# CSV is the #503 observation record: close that issue (ManddarinShop/Hikoutei#503)
+# once uptime spans days with failures near zero.
+#
+# Columns: date,uptime_s,sync_mode,req_total,req_failures,http429,db_bytes
+
+name: Ops metrics
+
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ops-metrics
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch public health numbers
+        id: health
+        run: |
+          set -euo pipefail
+          # Tolerant fetch: a down edge still records a (blank) row instead
+          # of failing the job — paging is health-ping's job, not this one's.
+          body=$(curl -fsS --max-time 25 https://hikoutei.cloud/api/health || echo '{}')
+          field() {
+            printf '%s' "$body" | node -e "let s='';process.stdin.on('data',d=>{s+=d}).on('end',()=>{const j=JSON.parse(s);console.log(($1) ?? '');});"
+          }
+          {
+            echo "uptime=$(field 'j.uptimeS')"
+            echo "mode=$(field 'j.syncMode')"
+            echo "total=$(field 'j.requestTelemetry && j.requestTelemetry.total')"
+            echo "failures=$(field 'j.requestTelemetry && j.requestTelemetry.failures')"
+            echo "http429=$(field 'j.requestTelemetry && j.requestTelemetry.http429')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Read SQLite size on the host
+        id: dbsize
+        env:
+          SSH_KEY: ${{ secrets.DEMO_SSH_KEY }}
+          SSH_HOST: ${{ secrets.DEMO_SSH_HOST }}
+          SSH_USER: ${{ secrets.DEMO_SSH_USER }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s' "$SSH_KEY" > ~/.ssh/metrics_probe
+          chmod 600 ~/.ssh/metrics_probe
+          bytes=$(ssh -i ~/.ssh/metrics_probe -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=20 "${SSH_USER}@${SSH_HOST}" 'vol=$(docker volume ls --format "{{.Name}}" | grep demo-data | head -1); sudo stat -c%s "/var/lib/docker/volumes/${vol}/_data/demo.sqlite"')
+          rm -f ~/.ssh/metrics_probe
+          echo "bytes=${bytes}" >> "$GITHUB_OUTPUT"
+
+      - name: Append row and push
+        run: |
+          set -euo pipefail
+          mkdir -p ops
+          if [ ! -f ops/metrics.csv ]; then
+            echo "date,uptime_s,sync_mode,req_total,req_failures,http429,db_bytes" > ops/metrics.csv
+          fi
+          printf '%s,%s,%s,%s,%s,%s,%s\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "${{ steps.health.outputs.uptime }}" \
+            "${{ steps.health.outputs.mode }}" \
+            "${{ steps.health.outputs.total }}" \
+            "${{ steps.health.outputs.failures }}" \
+            "${{ steps.health.outputs.http429 }}" \
+            "${{ steps.dbsize.outputs.bytes }}" >> ops/metrics.csv
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git pull --rebase --quiet
+          git add ops/metrics.csv
+          if git diff --quiet --cached; then
+            echo "no change"
+            exit 0
+          fi
+          git commit -m "chore(ops): daily metrics" --quiet
+          git push --quiet
