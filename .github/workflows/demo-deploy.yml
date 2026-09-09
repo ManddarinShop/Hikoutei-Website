@@ -21,6 +21,7 @@ on:
     branches: [main]
     paths:
       - "demo/**"
+      - "qa/**"
       - ".vitepress/**"
       - "guide/**"
       - "package.json"
