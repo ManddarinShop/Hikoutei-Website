@@ -1,0 +1,21 @@
+{
+  "name": "hikoutei-qa-skeleton",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Hikoutei QA harness skeleton: seeded random scenario ops against a local-only runtime.",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node --experimental-strip-types src/server.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "hikoutei": "0.10.19-dev"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  }
+}
