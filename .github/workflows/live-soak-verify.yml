@@ -50,11 +50,19 @@ jobs:
             mkdir -p /tmp/qa-sa && printf '%s' "$DEMO_SA_JSON" > /tmp/qa-sa/sa.json
             export GOOGLE_APPLICATION_CREDENTIALS=/tmp/qa-sa/sa.json
 
-            # Run the vendored engine directly against the live sheet.
-            cd qa
-            if [ ! -d node_modules ]; then npm ci --no-audit --no-fund; fi
-            node vendor/run-local-multitable-soak.mjs \
+            # Run the vendored engine inside the qa image (node + deps live
+            # there; the VM host has no npm). A fresh container per run keeps
+            # the ephemeral-DB replay guarantee.
+            docker compose -f demo/deploy/docker-compose.yml up -d --build qa >/dev/null 2>&1
+            QIMG=$(docker inspect --format '{{.Config.Image}}' $(docker ps -aq --filter "name=qa" | head -1))
+            docker run --rm \
+              --env-file demo/deploy/secrets/demo.env \
+              -e HIKOUTEI_SYNC_SPREADSHEET_URL="$HIKOUTEI_SYNC_SPREADSHEET_URL" \
+              -e GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa.json \
+              -v /tmp/qa-sa/sa.json:/tmp/sa.json:ro \
+              -v /tmp/live-verify:/tmp/live-verify \
+              --entrypoint node "$QIMG" \
+              vendor/run-local-multitable-soak.mjs \
               --duration-hours "$DURATION" \
-              --output-dir /tmp/live-verify-$(date -u +%H%M%S) \
-              2>&1 | tail -40
+              --output-dir /tmp/live-verify/run 2>&1 | tail -40
             rm -rf /tmp/qa-sa
