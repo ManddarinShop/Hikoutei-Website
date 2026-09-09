@@ -1,0 +1,60 @@
+# Live soak verification run — #381 + #364 closure evidence
+#
+# Runs the vendored soak engine against the LIVE QA sheet (sync env), so the
+# tombstone-race and shifted-edit guards are exercised in the environment the
+# issues were filed from. Self-contained: builds the engine's own deps, runs
+# against /tmp state, writes an artifact summary that the workflow prints.
+#
+# Requires the QA sheet secrets (QA_SYNC_SPREADSHEET_URL, QA_SA_JSON) and the
+# SSH secrets — same set as demo-deploy.
+
+name: Live soak verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_hours:
+        description: "Run duration in hours (fractions OK, e.g. 0.02)"
+        required: false
+        default: "0.02"
+
+permissions:
+  contents: read
+
+jobs:
+  live-soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Run live soak on the VM
+        uses: appleboy/ssh-action@v1
+        env:
+          DURATION: ${{ inputs.duration_hours || '0.02' }}
+        with:
+          host: ${{ secrets.DEMO_SSH_HOST }}
+          username: ${{ secrets.DEMO_SSH_USER }}
+          key: ${{ secrets.DEMO_SSH_KEY }}
+          envs: DURATION
+          script: |
+            set -euo pipefail
+            cd /opt/hikoutei-website
+            # Source the demo env for the sheet URL + SA key (QA reuses both).
+            set -a; source demo/deploy/secrets/demo.env; set +a
+            export HIKOUTEI_SYNC_SPREADSHEET_URL="$HIKOUTEI_SYNC_SPREADSHEET_URL"
+            mkdir -p /tmp/qa-sa && printf '%s' "$DEMO_SA_JSON" > /tmp/qa-sa/sa.json
+            export GOOGLE_APPLICATION_CREDENTIALS=/tmp/qa-sa/sa.json
+
+            # Run the vendored engine directly against the live sheet.
+            cd qa
+            if [ ! -d node_modules ]; then npm ci --no-audit --no-fund; fi
+            node vendor/run-local-multitable-soak.mjs \
+              --duration-hours "$DURATION" \
+              --output-dir /tmp/live-verify-$(date -u +%H%M%S) \
+              2>&1 | tail -40
+            rm -rf /tmp/qa-sa
