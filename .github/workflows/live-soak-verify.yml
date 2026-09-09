@@ -41,6 +41,7 @@ jobs:
           username: ${{ secrets.DEMO_SSH_USER }}
           key: ${{ secrets.DEMO_SSH_KEY }}
           envs: DURATION
+          command_timeout: 50m
           script: |
             set -euo pipefail
             cd /opt/hikoutei-website
