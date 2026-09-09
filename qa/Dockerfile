@@ -8,6 +8,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
 COPY src ./src
+COPY vendor ./vendor
 
 ENV NODE_ENV=production
 # Ephemeral database by design: every (re)start is a clean slate, so a
