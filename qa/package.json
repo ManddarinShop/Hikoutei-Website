@@ -12,7 +12,9 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "hikoutei": "0.10.19-dev"
+    "hikoutei": "0.10.19-dev",
+    "@mikro-orm/core": "7.1.7",
+    "@mikro-orm/sql": "7.1.7"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
