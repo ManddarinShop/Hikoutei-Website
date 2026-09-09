@@ -64,6 +64,7 @@ jobs:
             # — the same auth shape the demo server uses.
             docker run --rm \
               -e HIKOUTEI_SYNC_SPREADSHEET_URL="$HIKOUTEI_SYNC_SPREADSHEET_URL" \
+              -e GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa.json \
               -v /tmp/qa-sa/sa.json:/tmp/sa.json:ro \
               -v /tmp/live-verify:/tmp/live-verify \
               --entrypoint node "$QIMG" \
