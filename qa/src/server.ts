@@ -159,6 +159,64 @@ async function opFlushCycle(): Promise<void> {
   await em.flush();
 }
 
+/**
+ * Duplicate-PK insert must be REJECTED without touching state (mirrors the
+ * human-insert-duplicate-id family at entity level). A missing rejection
+ * is the failure; an unchanged state after rejection is the pass.
+ */
+async function opDuplicateInsert(id: string, stepNo: number): Promise<void> {
+  const em = hikoutei.em.fork();
+  em.persist(em.create(QARecord, { id, ...randomRow() }));
+  let rejected = false;
+  try {
+    await em.flush();
+  } catch {
+    rejected = true;
+  }
+  if (!rejected) {
+    throw new Error(`duplicate insert accepted for ${id} at step ${stepNo} (expected rejection)`);
+  }
+  await assertCount(stepNo);
+  await assertReadYourWrites([id], stepNo);
+}
+
+/**
+ * Same-value rewrite must leave state identical (mirrors the
+ * no-op-human-edit hypothesis: no churn, no ghosts).
+ */
+async function opNoOpUpdate(id: string, stepNo: number): Promise<void> {
+  const expected = model.get(id);
+  if (expected === undefined) throw new Error(`no-op target missing: ${id}`);
+  const em = hikoutei.em.fork();
+  const entity = await em.findOne(QARecord, { id });
+  if (entity === null) throw new Error(`no-op target missing: ${id}`);
+  entity.name = expected.name;
+  entity.amount = expected.amount;
+  entity.processed = expected.processed;
+  await em.flush();
+  await assertCount(stepNo);
+  await assertReadYourWrites([id], stepNo);
+}
+
+/**
+ * Delete then re-create the same id with new values (mirrors the
+ * delete-recreate family): the old row must vanish, the new one must read
+ * back exactly.
+ */
+async function opDeleteRecreate(id: string, stepNo: number): Promise<void> {
+  await opDelete(id);
+  const em = hikoutei.em.fork();
+  if (await em.findOne(QARecord, { id }) !== null) {
+    throw new Error(`deleted row ${id} still visible at step ${stepNo}`);
+  }
+  const row = randomRow();
+  const em2 = hikoutei.em.fork();
+  em2.persist(em2.create(QARecord, { id, ...row }));
+  await em2.flush();
+  model.set(id, row);
+  await assertReadYourWrites([id], stepNo);
+}
+
 // ---------------------------------------------------------------------------
 // Oracle: runtime must equal the model after every step
 // ---------------------------------------------------------------------------
@@ -201,17 +259,23 @@ async function step(): Promise<void> {
   try {
     const ids = [...model.keys()];
     const roll = rng();
-    if (ids.length === 0 || roll < 0.4) {
+    if (ids.length === 0 || roll < 0.3) {
       // Cap the mirror: evict a random row before growing past the limit.
       if (model.size >= MODEL_ROW_LIMIT) await opDelete(pick(ids));
       const created = await opCreate(1 + Math.floor(rng() * 3));
       await assertReadYourWrites(created, stepNo);
-    } else if (roll < 0.7) {
+    } else if (roll < 0.5) {
       const id = pick(ids);
       await opUpdate(id);
       await assertReadYourWrites([id], stepNo);
-    } else if (roll < 0.9) {
+    } else if (roll < 0.65) {
       await opDelete(pick(ids));
+    } else if (roll < 0.75) {
+      await opDuplicateInsert(pick(ids), stepNo);
+    } else if (roll < 0.85) {
+      await opNoOpUpdate(pick(ids), stepNo);
+    } else if (roll < 0.93) {
+      await opDeleteRecreate(pick(ids), stepNo);
     } else {
       await opFlushCycle();
     }
