@@ -1,0 +1,2 @@
+date,uptime_s,sync_mode,req_total,req_failures,http429,db_bytes
+2026-09-09T09:27:25Z,6959,sync,348,4,4,237568
