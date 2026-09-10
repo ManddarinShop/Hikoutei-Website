@@ -144,7 +144,7 @@ import {
   recordResourceIfAbsent,
   validateResumeHistory,
 } from "./resume.mjs";
-import { buildSummary, closeRuntimeWithFinalRetry } from "./summary.mjs";
+import { buildSummary, closeRuntimeWithFinalRetry, collectScenarioFailures } from "./summary.mjs";
 import { deadlineRemainingMs, sleep } from "./timing.mjs";
 import { detectLiveMode, loadOrInitState } from "./runnerStartup.mjs";
 
@@ -766,6 +766,12 @@ async function runSoakWithArtifacts(options, progress, artifacts) {
       progress(`final artifact write failed (${label}): ${stableErrorTag(error)}`);
     }
   };
+  // Redacted failing-scenario detail for the summary: derived from the
+  // already-sanitized in-memory cycle records (never raw plans/values),
+  // so a scenario-only failure stays attributable from summary.json
+  // alone. Computed once — the repair loop below reuses it (cycle records
+  // never change after the loop ends, only the state markers do).
+  const scenarioFailures = collectScenarioFailures(recording.cycleRecords);
   let summary = buildSummary({
     state,
     stopReason,
@@ -773,6 +779,7 @@ async function runSoakWithArtifacts(options, progress, artifacts) {
     live,
     closeError,
     replacementCloseError,
+    scenarioFailures,
   });
   await finalizeStep("summary", () => artifacts.writeJson("summaryJson", summary));
   await finalizeStep("markdown", () => artifacts.writeMarkdown(renderSummaryMarkdown(summary)));
@@ -853,6 +860,7 @@ async function runSoakWithArtifacts(options, progress, artifacts) {
         closeError,
         replacementCloseError,
         finalizationFailures,
+        scenarioFailures,
       });
     }
     if (stateAttempts < 1 && (stopReason !== "artifact-write-failed" || persistFailedMarkers)) {

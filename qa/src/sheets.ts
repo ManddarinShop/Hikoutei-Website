@@ -43,6 +43,8 @@ export function columnToLetter(column: number): string {
 
 export interface SheetsDirect {
   readonly spreadsheetId: string;
+  /** Tab titles in tab order (metadata only — no cell values). */
+  listTabs(): Promise<readonly string[]>;
   /** Raw cell grid for an A1 range (rows of values, may be ragged). */
   readRange(tab: string, a1Range: string): Promise<readonly (readonly unknown[])[]>;
   /** Human-typing write of one cell (1-based row/column). */
@@ -89,6 +91,12 @@ export async function createSheetsDirect(args: {
 
   return {
     spreadsheetId,
+    async listTabs(): Promise<readonly string[]> {
+      const meta = (await authed(`?fields=sheets.properties.title`)) as {
+        sheets?: readonly { properties?: { title?: string } }[];
+      };
+      return (meta.sheets ?? []).map((sheet) => sheet.properties?.title ?? "");
+    },
     async readRange(tab, a1Range): Promise<readonly (readonly unknown[])[]> {
       const body = (await authed(
         `/values/${encodeURIComponent(tab)}!${encodeURIComponent(a1Range)}`,

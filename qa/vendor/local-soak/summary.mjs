@@ -1,14 +1,12 @@
 /**
  * Redacted finale/close helpers: the final summary builder and the
- * final-retry runtime close. Depends only on errors/redact/performance.
+ * final-retry runtime close. Depends only on errors/redact/performance
+ * plus the scenario record sanitizer (no scenario internals).
  */
 import { performance } from "node:perf_hooks";
 import { describeError } from "./errors.mjs";
-import {
-  sanitizeErrorClass,
-  sanitizeReason,
-  sanitizeStableCode,
-} from "./redact.mjs";
+import { sanitizeErrorClass, sanitizeReason, sanitizeStableCode } from "./redact.mjs";
+import { sanitizeScenarioRecord } from "./scenarios/scenarioVocabulary.mjs";
 
 /** Builds the redacted final summary object. */
 function buildSummary({
@@ -19,6 +17,10 @@ function buildSummary({
   closeError,
   replacementCloseError,
   finalizationFailures = [],
+  // Redacted per-scenario failure detail from collectScenarioFailures()
+  // (already-sanitized cycle records only — never raw plans or values).
+  // Always an array (possibly empty) so workflow parsing stays stable.
+  scenarioFailures = [],
 }) {
   const status =
     stopReason === "max-consecutive-failures" ||
@@ -67,6 +69,12 @@ function buildSummary({
       failures: state.cumulative.scenarioFailures ?? 0,
     },
     tableRows: state.tableRows,
+    // Dedicated failing-scenario detail: one entry per failed scenario
+    // record (cycle/id/phase plus the allowlisted reason diagnostics),
+    // so a scenario-only failure stays attributable from the summary
+    // alone — the per-cycle JSONL is not always reachable (e.g. a
+    // remote-only run directory). Never carries ids, values, or URLs.
+    scenarioFailures,
     // Recovery section: a resume reconciled an interrupted run. The reason
     // is a fixed vocabulary value and the cycle a number — never an id,
     // path, or message. Present only when the state records a recovery.
@@ -113,6 +121,59 @@ function buildSummary({
       },
     }),
   };
+}
+
+/**
+ * Collects the redacted failing-scenario entries for the final summary.
+ *
+ * Reads the in-memory recorded cycle records (`scenarios` arrays written
+ * by cycleRecord) and returns one entry per scenario record with
+ * `failures > 0` or `status === "failed"`, ordered by (cycle, order) and
+ * bounded to `limit` entries. Every entry passes through
+ * `sanitizeScenarioRecord`, so only fixed-vocabulary strings and
+ * non-negative counters survive — a malformed or forged record can never
+ * inject text into the summary (unknown values collapse to `unknown`).
+ *
+ * @param {Map<number, object> | Record<string, object>} cycleRecords
+ *   recorded cycle records by cycle number.
+ * @param {number} [limit] maximum entries (default 30).
+ * @returns {Array<object>} redacted failing-scenario entries.
+ */
+function collectScenarioFailures(cycleRecords, limit = 30) {
+  const entries = [];
+  const records = cycleRecords instanceof Map
+    ? [...cycleRecords.entries()]
+    : Object.entries(cycleRecords ?? {}).map(([cycle, record]) => [Number(cycle), record]);
+  records.sort((a, b) => a[0] - b[0]);
+  for (const [cycle, record] of records) {
+    if (!Number.isInteger(cycle)) continue;
+    const scenarios = record !== null && typeof record === "object" && !Array.isArray(record)
+      ? record.scenarios
+      : undefined;
+    if (!Array.isArray(scenarios)) continue;
+    const sorted = [...scenarios].sort((a, b) => (a?.order ?? 0) - (b?.order ?? 0));
+    for (const entry of sorted) {
+      const clean = sanitizeScenarioRecord(entry);
+      if (clean === undefined) continue;
+      if (!((Number.isInteger(clean.failures) && clean.failures > 0) || clean.status === "failed")) continue;
+      entries.push({
+        cycle,
+        id: clean.id,
+        phase: clean.phase,
+        order: clean.order,
+        status: clean.status,
+        failures: clean.failures,
+        ...(clean.cleanupFailures > 0 ? { cleanupFailures: clean.cleanupFailures } : {}),
+        ...(clean.expectedErrors > 0 ? { expectedErrors: clean.expectedErrors } : {}),
+        ...(clean.reason !== undefined ? { reason: clean.reason } : {}),
+        ...(clean.reasonTag !== undefined ? { reasonTag: clean.reasonTag } : {}),
+        ...(clean.failureKinds !== undefined ? { failureKinds: [...clean.failureKinds] } : {}),
+        ...(clean.targetTable !== undefined ? { targetTable: clean.targetTable } : {}),
+      });
+      if (entries.length >= limit) return entries;
+    }
+  }
+  return entries;
 }
 
 /**
@@ -194,4 +255,5 @@ export async function closeRuntimeWithFinalRetry(runtime, options = {}) {
 // Final redacted summary builder consumed by runner.mjs.
 export {
   buildSummary,
+  collectScenarioFailures,
 };
