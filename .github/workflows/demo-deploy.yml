@@ -122,10 +122,25 @@ jobs:
             for i in 1 2 3 4 5 6; do
               if curl -fsS --resolve hikoutei.cloud:443:127.0.0.1 https://hikoutei.cloud/api/health | grep -q '"syncMode":"sync"'; then
                 echo "health OK: sync mode"
+                break
+              fi
+              if [ "$i" = 6 ]; then
+                echo "health check failed — demo server did not report sync mode"
+                docker compose -f /opt/hikoutei-website/demo/deploy/docker-compose.yml logs --tail 50
+                exit 1
+              fi
+              sleep 5
+            done
+            echo "--- qa oracle ---"
+            for i in 1 2 3 4 5 6; do
+              if curl -fsS --resolve hikoutei.cloud:443:127.0.0.1 --max-time 20 https://hikoutei.cloud/api/qa-health | grep -Eq '"ok"[[:space:]]*:[[:space:]]*true'; then
+                echo "qa health OK: oracle clean"
                 exit 0
               fi
               sleep 5
             done
-            echo "health check failed — demo server did not report sync mode"
-            docker compose -f /opt/hikoutei-website/demo/deploy/docker-compose.yml logs --tail 50
+            echo "qa health check failed — oracle reports failure (or qa unreachable)"
+            curl -sS --resolve hikoutei.cloud:443:127.0.0.1 --max-time 20 https://hikoutei.cloud/api/qa-health || true
+            echo
+            docker compose -f /opt/hikoutei-website/demo/deploy/docker-compose.yml logs --tail 30 qa
             exit 1

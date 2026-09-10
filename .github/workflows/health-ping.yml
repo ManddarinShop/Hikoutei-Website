@@ -4,6 +4,15 @@
 # this pings the public edge on a short cadence and fails loud otherwise.
 # No SSH, no secrets: pure public-surface proof. Failure mails go to repo
 # watchers (repo Watch settings); add a chat webhook when one exists.
+#
+# QA oracle watch (integrated here, not a separate workflow): the same tick
+# also fetches /api/qa-health and fails on transport error, ok:false, or
+# failures>0. One schedule instead of two keeps the ping and the filing in
+# the same run, so the issue body always matches the payload that failed —
+# a separate workflow would re-fetch minutes later and risk reporting a
+# different seed/step. The filing step below (if: failure()) re-reads the
+# saved payload and opens (or comments on) a "QA oracle failure" issue,
+# deduped per seed so a stuck oracle does not spam issues.
 
 name: Health ping
 
@@ -11,6 +20,11 @@ on:
   schedule:
     - cron: "*/15 * * * *"
   workflow_dispatch:
+
+# GITHUB_TOKEN needs issues:write for the QA failure filing step below.
+# No checkout, no other scopes: curl-only checks plus gh issue create/comment.
+permissions:
+  issues: write
 
 jobs:
   ping:
@@ -28,3 +42,88 @@ jobs:
             exit 1
           }
           echo "edge sync ok"
+
+      - name: Check QA oracle health
+        run: |
+          set -euo pipefail
+          body=$(curl -fsS --max-time 25 https://hikoutei.cloud/api/qa-health)
+          printf '%s' "$body" > "$RUNNER_TEMP/qa-health.json"
+          python3 - <<'EOF'
+          import json, os, sys
+          h = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "qa-health.json")))
+          print("iterations=%s failures=%s" % (h.get("iterations"), h.get("failures")))
+          print("lastFailure=%s" % json.dumps(h.get("lastFailure")))
+          if h.get("ok") is not True or (h.get("failures") or 0) > 0:
+              print("QA ORACLE FAILURE")
+              sys.exit(1)
+          print("qa oracle ok")
+          EOF
+
+      - name: File QA oracle failure issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Scoped to QA: a demo-only edge failure still fails this workflow
+          # (loud page) but must not file a QA oracle issue.
+          payload=$(cat "$RUNNER_TEMP/qa-health.json" 2>/dev/null || curl -fsS --max-time 25 https://hikoutei.cloud/api/qa-health || echo '{}')
+          printf '%s' "$payload" > /tmp/qa-payload.json
+          python3 - <<'EOF'
+          import json
+          try:
+              h = json.load(open('/tmp/qa-payload.json'))
+          except Exception:
+              h = {}
+          if not isinstance(h, dict):
+              h = {}
+          lf = h.get('lastFailure') or {}
+          seed = lf.get('seed', h.get('seed', 'unknown'))
+          step = lf.get('step', 'unknown')
+          op = lf.get('op', 'unknown')
+          open('/tmp/qa-title.txt', 'w').write(
+              f"QA oracle failure \u2014 seed {seed} step {step} op {op}")
+          summary = {k: h.get(k) for k in ('ok', 'seed', 'syncMode', 'iterations', 'failures')}
+          lines = [
+              'QA oracle failure detected by the Health ping workflow.',
+              '',
+              '## Health summary',
+              '```json',
+              json.dumps(summary, indent=2),
+              '```',
+              '',
+              '## lastFailure',
+              '```json',
+              json.dumps(h.get('lastFailure'), indent=2),
+              '```',
+              '',
+              '## Repro',
+              f"Run the QA harness with `QA_SEED={seed}` and watch `/api/qa-health` "
+              f"\u2014 the same seed replays the identical run (see qa/README.md).",
+          ]
+          open('/tmp/qa-body.md', 'w').write('\n'.join(lines) + '\n')
+          # QA scope guard for the shell below.
+          open('/tmp/qa-is-failure.txt', 'w').write(
+              'yes' if (h.get('ok') is not True or (h.get('failures') or 0) > 0) else 'no')
+          open('/tmp/qa-seed.txt', 'w').write(str(seed))
+          EOF
+          if [ "$(cat /tmp/qa-is-failure.txt)" != "yes" ]; then
+            echo "no QA oracle failure in payload — demo-only failure, skipping issue"
+            exit 0
+          fi
+          seed=$(cat /tmp/qa-seed.txt)
+          expected=$(cat /tmp/qa-title.txt)
+          existing=$(gh issue list -R ManddarinShop/Hikoutei-Website --state open --json number,title --limit 50)
+          match=$(printf '%s' "$existing" | python3 -c '
+          import json, sys
+          expected = sys.argv[1]
+          issues = json.load(sys.stdin)
+          hit = next((str(i["number"]) for i in issues if i.get("title", "") == expected), "")
+          print(hit)
+          ' "$expected")
+          if [ -n "$match" ]; then
+            echo "open issue #$match already tracks seed $seed — commenting only"
+            gh issue comment "$match" -R ManddarinShop/Hikoutei-Website --body-file /tmp/qa-body.md
+          else
+            gh issue create -R ManddarinShop/Hikoutei-Website --title "$(cat /tmp/qa-title.txt)" --body-file /tmp/qa-body.md
+          fi
