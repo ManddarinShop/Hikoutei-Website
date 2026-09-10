@@ -6,7 +6,8 @@
 # CSV is the #503 observation record: close that issue (ManddarinShop/Hikoutei#503)
 # once uptime spans days with failures near zero.
 #
-# Columns: date,uptime_s,sync_mode,req_total,req_failures,http429,db_bytes
+# Columns: date,uptime_s,sync_mode,req_total,req_failures,http429,db_bytes,
+#   qa_iterations,qa_failures,qa_ops_total,qa_ops_fail,qa_op_counters(JSON)
 
 name: Ops metrics
 
@@ -48,6 +49,23 @@ jobs:
             echo "http429=$(field 'j.requestTelemetry && j.requestTelemetry.http429')"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Fetch QA harness numbers
+        id: qa
+        run: |
+          set -euo pipefail
+          # Tolerant fetch, same policy as above: QA down still records a row.
+          qbody=$(curl -fsS --max-time 25 https://hikoutei.cloud/api/qa-health || echo '{}')
+          qfield() {
+            printf '%s' "$qbody" | node -e "let s='';process.stdin.on('data',d=>{s+=d}).on('end',()=>{let j={};try{j=JSON.parse(s)}catch{};console.log(($1) ?? '');});"
+          }
+          {
+            echo "iterations=$(qfield 'j.iterations')"
+            echo "failures=$(qfield 'j.failures')"
+            echo "ops_total=$(qfield 'j.opCounters ? Object.values(j.opCounters).reduce((a,c)=>a+(c.total||0),0) : undefined')"
+            echo "ops_fail=$(qfield 'j.opCounters ? Object.values(j.opCounters).reduce((a,c)=>a+(c.fail||0),0) : undefined')"
+            echo "counters=$(qfield 'j.opCounters ? JSON.stringify(j.opCounters) : undefined')"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Read SQLite size on the host
         id: dbsize
         env:
@@ -63,28 +81,64 @@ jobs:
           rm -f ~/.ssh/metrics_probe
           echo "bytes=${bytes}" >> "$GITHUB_OUTPUT"
 
-      - name: Append row and push
+      - name: Append row and push (clean-base update)
         run: |
           set -euo pipefail
-          mkdir -p ops
-          if [ ! -f ops/metrics.csv ]; then
-            echo "date,uptime_s,sync_mode,req_total,req_failures,http429,db_bytes" > ops/metrics.csv
-          fi
-          printf '%s,%s,%s,%s,%s,%s,%s\n' \
-            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            "${{ steps.health.outputs.uptime }}" \
-            "${{ steps.health.outputs.mode }}" \
-            "${{ steps.health.outputs.total }}" \
-            "${{ steps.health.outputs.failures }}" \
-            "${{ steps.health.outputs.http429 }}" \
-            "${{ steps.dbsize.outputs.bytes }}" >> ops/metrics.csv
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git pull --rebase --quiet
-          git add ops/metrics.csv
-          if git diff --quiet --cached; then
-            echo "no change"
-            exit 0
-          fi
-          git commit -m "chore(ops): daily metrics" --quiet
-          git push --quiet
+          # No `git pull --rebase` here: it fails (exit 128) when the
+          # checkout carries local state. Rebase the base instead — fetch
+          # and hard-reset BEFORE appending, so the tree is always clean.
+          BRANCH="${GITHUB_REF_NAME:-main}"
+          NEW_HEADER="date,uptime_s,sync_mode,req_total,req_failures,http429,db_bytes,qa_iterations,qa_failures,qa_ops_total,qa_ops_fail,qa_op_counters"
+          sync_base() {
+            git fetch origin "$BRANCH" --quiet
+            git reset --hard "origin/$BRANCH" --quiet
+          }
+          ensure_header() {
+            mkdir -p ops
+            if [ ! -f ops/metrics.csv ]; then
+              printf '%s\n' "$NEW_HEADER" > ops/metrics.csv
+            elif [ "$(head -n 1 ops/metrics.csv)" = "date,uptime_s,sync_mode,req_total,req_failures,http429,db_bytes" ]; then
+              # Old 7-column header: upgrade in place; old short rows read as empty.
+              sed -i '1s/.*/date,uptime_s,sync_mode,req_total,req_failures,http429,db_bytes,qa_iterations,qa_failures,qa_ops_total,qa_ops_fail,qa_op_counters/' ops/metrics.csv
+            fi
+          }
+          commit_row() {
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add ops/metrics.csv
+            if git diff --quiet --cached; then
+              echo "no change"
+              return 1
+            fi
+            git commit -m "chore(ops): daily metrics" --quiet
+            return 0
+          }
+          TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          COUNTERS_CSV=$(printf '%s' '${{ steps.qa.outputs.counters }}' | sed 's/"/""/g')
+          ROW=$(printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"%s"' \
+            "$TS" \
+            '${{ steps.health.outputs.uptime }}' \
+            '${{ steps.health.outputs.mode }}' \
+            '${{ steps.health.outputs.total }}' \
+            '${{ steps.health.outputs.failures }}' \
+            '${{ steps.health.outputs.http429 }}' \
+            '${{ steps.dbsize.outputs.bytes }}' \
+            '${{ steps.qa.outputs.iterations }}' \
+            '${{ steps.qa.outputs.failures }}' \
+            '${{ steps.qa.outputs.ops_total }}' \
+            '${{ steps.qa.outputs.ops_fail }}' \
+            "$COUNTERS_CSV")
+          append_row() {
+            ensure_header
+            printf '%s\n' "$ROW" >> ops/metrics.csv
+          }
+          sync_base
+          append_row
+          if ! commit_row; then exit 0; fi
+          if git push --quiet origin "HEAD:$BRANCH"; then exit 0; fi
+          # Lost a race with another writer: rebuild on the fresh base once.
+          echo "push raced, retrying on fresh base"
+          sync_base
+          append_row
+          if ! commit_row; then exit 0; fi
+          git push --quiet origin "HEAD:$BRANCH"

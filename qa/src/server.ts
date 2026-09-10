@@ -14,11 +14,13 @@
  * seed always replays identically.
  *
  * HTTP surface:
- *   GET /api/qa-health   { ok, seed, iterations, failures, lastFailure }
+ *   GET /api/qa-health   { ok, seed, syncMode, uptimeS, iterations,
+ *                            failures, lastFailure, opCounters }
  */
 
 import { createServer } from "node:http";
-import { writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { createTypedSheets } from "hikoutei";
 import { QARecord, type ExpectedRow, type ModelMirror } from "./entity.ts";
 import {
@@ -70,14 +72,47 @@ interface FailureReport {
 
 const failures: FailureReport[] = [];
 let iterations = 0;
+const startedAt = Date.now();
+
+/** Per-op run/success/failure counters (health + persisted verdicts). */
+type OpName =
+  | "create" | "update" | "delete" | "duplicateInsert"
+  | "noOpUpdate" | "deleteRecreate" | "flushCycle";
+const opCounters: Record<OpName, { total: number; ok: number; fail: number }> = {
+  create: { total: 0, ok: 0, fail: 0 },
+  update: { total: 0, ok: 0, fail: 0 },
+  delete: { total: 0, ok: 0, fail: 0 },
+  duplicateInsert: { total: 0, ok: 0, fail: 0 },
+  noOpUpdate: { total: 0, ok: 0, fail: 0 },
+  deleteRecreate: { total: 0, ok: 0, fail: 0 },
+  flushCycle: { total: 0, ok: 0, fail: 0 },
+};
+
+/**
+ * Verdict persistence: append-only JSONL on a volume-mounted path
+ * (deploy: `/data/qa-history.jsonl`). Only verdicts persist — the DB
+ * stays ephemeral so a recorded seed always replays identically.
+ * Missing/unwritable path degrades to in-memory health (warn once).
+ */
+const QA_HISTORY_PATH = process.env.QA_HISTORY_PATH ?? "/data/qa-history.jsonl";
+let historyWarned = false;
+
+function appendHistory(record: unknown): void {
+  try {
+    mkdirSync(dirname(QA_HISTORY_PATH), { recursive: true });
+    appendFileSync(QA_HISTORY_PATH, `${JSON.stringify(record)}\n`);
+  } catch (error) {
+    if (!historyWarned) {
+      historyWarned = true;
+      console.warn(`[qa] history append disabled (${QA_HISTORY_PATH}):`, error);
+    }
+  }
+}
 
 function recordFailure(step: number, op: string, error: unknown): void {
-  failures.push({
-    seed: SEED,
-    step,
-    op,
-    detail: error instanceof Error ? error.message : String(error),
-  });
+  const detail = error instanceof Error ? error.message : String(error);
+  failures.push({ seed: SEED, step, op, detail });
+  appendHistory({ type: "failure", ts: new Date().toISOString(), seed: SEED, step, op, detail });
   if (failures.length > FAILURE_BUFFER_LIMIT) failures.shift();
   console.error(`[qa] step ${step} op ${op} failed (seed ${SEED}):`, error);
 }
@@ -125,6 +160,12 @@ const hikoutei = await createTypedSheets({
   entities: [QARecord],
 });
 console.log(`[qa] runtime ready (sync: ${syncEnabled ? "on" : "off"})`);
+appendHistory({
+  type: "boot",
+  ts: new Date().toISOString(),
+  seed: SEED,
+  syncMode: syncEnabled ? "sync" : "local",
+});
 
 // ---------------------------------------------------------------------------
 // Ops: each mutates runtime + model identically, then flushes
@@ -201,6 +242,19 @@ async function opDeleteRecreate(id: string, stepNo: number): Promise<void> {
   await assertRows(hikoutei, model, [id], stepNo);
 }
 
+/** One scheduled op with per-op counters; rethrows for step-level recording. */
+async function runOp<T>(name: OpName, fn: () => Promise<T>): Promise<T> {
+  opCounters[name].total += 1;
+  try {
+    const result = await fn();
+    opCounters[name].ok += 1;
+    return result;
+  } catch (error) {
+    opCounters[name].fail += 1;
+    throw error;
+  }
+}
+
 /** One scheduled step: random op, then the oracle. Never throws. */
 let stepRunning = false;
 
@@ -213,23 +267,23 @@ async function step(): Promise<void> {
     const roll = rng();
     if (ids.length === 0 || roll < 0.3) {
       // Cap the mirror: evict a random row before growing past the limit.
-      if (model.size >= MODEL_ROW_LIMIT) await opDelete(pick(ids));
-      const created = await opCreate(1 + Math.floor(rng() * 3));
+      if (model.size >= MODEL_ROW_LIMIT) await runOp("delete", () => opDelete(pick(ids)));
+      const created = await runOp("create", () => opCreate(1 + Math.floor(rng() * 3)));
       await assertRows(hikoutei, model, created, stepNo);
     } else if (roll < 0.5) {
       const id = pick(ids);
-      await opUpdate(id);
+      await runOp("update", () => opUpdate(id));
       await assertRows(hikoutei, model, [id], stepNo);
     } else if (roll < 0.65) {
-      await opDelete(pick(ids));
+      await runOp("delete", () => opDelete(pick(ids)));
     } else if (roll < 0.75) {
-      await opDuplicateInsert(pick(ids), stepNo);
+      await runOp("duplicateInsert", () => opDuplicateInsert(pick(ids), stepNo));
     } else if (roll < 0.85) {
-      await opNoOpUpdate(pick(ids), stepNo);
+      await runOp("noOpUpdate", () => opNoOpUpdate(pick(ids), stepNo));
     } else if (roll < 0.93) {
-      await opDeleteRecreate(pick(ids), stepNo);
+      await runOp("deleteRecreate", () => opDeleteRecreate(pick(ids), stepNo));
     } else {
-      await opFlushCycle();
+      await runOp("flushCycle", () => opFlushCycle());
     }
     await assertCount(hikoutei, model, stepNo);
   } catch (error) {
@@ -250,9 +304,11 @@ const app = createServer((req, res) => {
       ok: failures.length === 0,
       seed: SEED,
       syncMode: syncEnabled ? "sync" : "local",
+      uptimeS: Math.floor((Date.now() - startedAt) / 1000),
       iterations,
       failures: failures.length,
       lastFailure: failures.at(-1) ?? null,
+      opCounters,
     }));
     return;
   }
@@ -268,3 +324,18 @@ const timer = setInterval(() => {
   void step();
 }, QA_TICK_MS);
 timer.unref();
+
+/** Periodic verdict summary so iteration/uptime/counters survive restarts. */
+const SUMMARY_MS = 60_000;
+const summaryTimer = setInterval(() => {
+  appendHistory({
+    type: "summary",
+    ts: new Date().toISOString(),
+    seed: SEED,
+    iterations,
+    failures: failures.length,
+    uptimeS: Math.floor((Date.now() - startedAt) / 1000),
+    opCounters,
+  });
+}, SUMMARY_MS);
+summaryTimer.unref();
