@@ -1,0 +1,141 @@
+# QA sync nightly — human-lane verification against the QA sheet.
+#
+# Once a night the qa service is restarted in sync mode, the bounded
+# human-lane verifier (qa/src/human-lane-verify.ts) runs a safe scenario
+# against the QA sheet inside an ephemeral container (15m bound), and the
+# service is restored to local-only. The verifier prints one JSON verdict
+# (steps plus apiCalls/throttled429 pacing counters) to the log.
+#
+# Sheet isolation: QA sheet ONLY (QA_SYNC_SPREADSHEET_URL secret — never
+# the demo sheet). Keys are consumed from Secrets/env and never printed.
+# On any failure an issue is filed (or commented), deduped by full title
+# like the Health ping QA-oracle filing.
+
+name: QA sync nightly
+
+on:
+  schedule:
+    # 03:30 UTC — after the 02:30 live-soak nightly on the same QA sheet.
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+
+# The QA sheet is a single-writer resource: live-soak and the sync
+# nightly must never overlap on it. Queue (never cancel) behind whoever
+# holds the sheet.
+concurrency:
+  group: qa-sheet
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  sync-qa:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run human-lane verification on the VM
+        uses: appleboy/ssh-action@v1
+        env:
+          QA_SHEET_URL: ${{ secrets.QA_SYNC_SPREADSHEET_URL }}
+          RUN_ID: ${{ github.run_id }}
+        with:
+          host: ${{ secrets.DEMO_SSH_HOST }}
+          username: ${{ secrets.DEMO_SSH_USER }}
+          key: ${{ secrets.DEMO_SSH_KEY }}
+          envs: QA_SHEET_URL,RUN_ID
+          command_timeout: 20m
+          script: |
+            set -euo pipefail
+            cd /opt/hikoutei-website
+            # QA sheet only, fail closed: the verifier must never run
+            # against the demo sheet.
+            if [ -z "${QA_SHEET_URL:-}" ]; then
+              echo "qa-sync-nightly needs the QA_SYNC_SPREADSHEET_URL secret"
+              exit 1
+            fi
+            # SA key material (same key as demo — quota shared): file shape,
+            # never sourced (bash `source` strips JSON quotes).
+            mkdir -p /tmp/qa-sa
+            sed -n 's/^DEMO_SA_JSON=//p' demo/deploy/secrets/demo.env > /tmp/qa-sa/sa.json
+            python3 -m json.tool /tmp/qa-sa/sa.json > /dev/null
+            docker compose -f demo/deploy/docker-compose.yml up -d --build qa >/dev/null 2>&1
+            QIMG=$(docker inspect --format '{{.Config.Image}}' $(docker ps -aq --filter "name=qa" | head -1))
+            RESTORED="unknown"
+            VERIFY_EXIT=0
+            # Local-only restore runs on EVERY exit (verifier failure or an
+            # early failure after sync mode was enabled), so the service
+            # never stays in sync mode overnight. Idempotent: safe twice.
+            restore_qa() {
+              echo "=== restoring qa to local-only ==="
+              unset QA_SYNC_SPREADSHEET_URL QA_SA_JSON || true
+              docker compose -f demo/deploy/docker-compose.yml up -d qa >/dev/null 2>&1 || true
+              sleep 10
+              RESTORED=$(docker compose -f demo/deploy/docker-compose.yml exec -T qa node -e "fetch('http://localhost:3201/api/qa-health').then(r=>r.json()).then(h=>console.log(h.syncMode)).catch(()=>console.log('unreachable'))" || echo "exec-failed")
+              echo "qa syncMode after restore: $RESTORED"
+              rm -rf /tmp/qa-sa || true
+            }
+            trap restore_qa EXIT
+            # 1. Restart the qa service in sync mode (compose interpolates
+            # the exported vars at `up` time).
+            export QA_SYNC_SPREADSHEET_URL="$QA_SHEET_URL"
+            export QA_SA_JSON="$(cat /tmp/qa-sa/sa.json)"
+            docker compose -f demo/deploy/docker-compose.yml up -d qa >/dev/null 2>&1
+            sleep 10
+            # 2. Bounded human-lane verifier (ephemeral container, QA sheet
+            # only). Verdict JSON to stdout (counts/steps only — no values).
+            timeout 15m docker run --rm \
+              -e QA_SYNC_SPREADSHEET_URL="$QA_SHEET_URL" \
+              -e QA_SA_JSON="$(cat /tmp/qa-sa/sa.json)" \
+              -e QA_VERIFY_RUN_ID="$RUN_ID" \
+              --entrypoint node "$QIMG" \
+              --experimental-strip-types src/human-lane-verify.ts \
+              > /tmp/qa-sync-nightly.json 2> /tmp/qa-sync-nightly.log || VERIFY_EXIT=$?
+            echo "=== verifier verdict ==="
+            cat /tmp/qa-sync-nightly.json 2>/dev/null || echo "(no verifier verdict)"
+            echo "=== verifier log tail ==="
+            tail -20 /tmp/qa-sync-nightly.log 2>/dev/null || true
+            # 3. Explicit restore (the EXIT trap stays as the safety net for
+            # the failing exits below) and prove the mode flip through the
+            # service health endpoint.
+            restore_qa
+            trap - EXIT
+            if [ "$VERIFY_EXIT" -ne 0 ]; then
+              echo "RESULT=failed: human-lane verification failed"
+              exit 1
+            fi
+            if [ "$RESTORED" != "local" ]; then
+              echo "RESULT=failed: qa not restored to local-only"
+              exit 1
+            fi
+            echo "RESULT=passed"
+
+      - name: File sync QA failure issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          title="QA sync nightly failure"
+          run_url="https://github.com/ManddarinShop/Hikoutei-Website/actions/runs/${{ github.run_id }}"
+          body="The QA sync nightly workflow failed — see the run log for the verifier verdict and pacing counters.
+          - Run: $run_url
+          - Verifier: ephemeral human-lane run (tab discovery, readRange, appendRow ingestion, cleanup) against the QA sheet, 15m bound.
+          - The qa service is restored to local-only by the workflow even on failure (check the log tail for the restore line)."
+          existing=$(gh issue list -R ManddarinShop/Hikoutei-Website --state open --json number,title --limit 50)
+          match=$(printf '%s' "$existing" | python3 -c '
+          import json, sys
+          expected = sys.argv[1]
+          issues = json.load(sys.stdin)
+          hit = next((str(i["number"]) for i in issues if i.get("title", "") == expected), "")
+          print(hit)
+          ' "$title")
+          if [ -n "$match" ]; then
+            echo "open issue #$match already tracks the nightly — commenting only"
+            gh issue comment "$match" -R ManddarinShop/Hikoutei-Website --body "$body"
+          else
+            gh issue create -R ManddarinShop/Hikoutei-Website --title "$title" --body "$body"
+          fi

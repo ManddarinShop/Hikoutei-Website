@@ -9,6 +9,10 @@
 #   2. both demo containers running
 #   3. :443 served via docker-proxy (no k8s listener)
 #   4. public edge reports sync mode (end-to-end proof)
+#   5. qa container running + /api/qa-health reachable (200 + qa payload)
+#      (wiring proof only — the oracle verdict ok:false is health-ping's job,
+#      which files the "QA oracle failure" issue; drift-watch must not
+#      double-page on an oracle failure, only on an unreachable qa)
 #
 # Any mismatch fails the workflow (GitHub notifies). The VM user needs
 # passwordless sudo for the listener check; without it step 3 errors loud
@@ -42,6 +46,7 @@ jobs:
             # bare), so match either generation and reuse the names below.
             caddy=$(docker ps --format '{{.Names}}' | grep -E '^(deploy-)?caddy-1$' | head -1 || true)
             server=$(docker ps --format '{{.Names}}' | grep -E '^(deploy-)?demo-server-1$' | head -1 || true)
+            qa=$(docker ps --format '{{.Names}}' | grep -E '^(deploy-)?qa-1$' | head -1 || true)
             if [ -n "$caddy" ]; then
               echo "ok: caddy $caddy running"
             else
@@ -52,6 +57,12 @@ jobs:
               echo "ok: demo-server $server running"
             else
               echo "DRIFT: demo-server container missing"
+              fail=1
+            fi
+            if [ -n "$qa" ]; then
+              echo "ok: qa $qa running"
+            else
+              echo "DRIFT: qa container missing"
               fail=1
             fi
 
@@ -85,11 +96,23 @@ jobs:
               fail=1
             fi
 
+            echo "--- qa edge (wiring only) ---"
+            # qa-health always answers 200, even on ok:false — so a 200
+            # with the qa payload proves Caddy -> qa wiring is alive.
+            if curl -fsS --max-time 20 https://hikoutei.cloud/api/qa-health | grep -Eq '"ok"[[:space:]]*:'; then
+              echo "ok: qa-health reachable"
+            else
+              echo "DRIFT: qa-health not reachable (HTTP fail or wrong payload)"
+              fail=1
+            fi
+
             if [ "$fail" -ne 0 ]; then
               echo "=== context: caddy tail ==="
               if [ -n "$caddy" ]; then docker logs "$caddy" --tail 5 2>&1 || true; fi
               echo "=== context: demo-server tail (crash reason) ==="
               if [ -n "$server" ]; then docker logs "$server" --tail 15 2>&1 || true; fi
+              echo "=== context: qa tail ==="
+              if [ -n "$qa" ]; then docker logs "$qa" --tail 15 2>&1 || true; fi
               exit 1
             fi
             echo "drift check clean"

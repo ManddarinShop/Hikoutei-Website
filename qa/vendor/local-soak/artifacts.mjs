@@ -865,6 +865,19 @@ export function renderSummaryMarkdown(summary) {
     // failure stays visible in the markdown even when the operation failure
     // count is zero.
     `- Scenarios: ${summary.scenarios.expectedErrors} expected errors, ${summary.scenarios.failures} failures`,
+    // Redacted failing-scenario detail (fixed-vocabulary fields only): one
+    // line per failed scenario record so a scenario-only failure is
+    // attributable from the markdown alone.
+    ...(summary.scenarioFailures === undefined || summary.scenarioFailures.length === 0 ? [] : [
+      `- Failing scenarios (${summary.scenarioFailures.length}):`,
+      ...summary.scenarioFailures.map((entry) =>
+        `  - cycle ${entry.cycle} ${entry.id ?? "unknown"} (${entry.phase ?? "unknown"}): ` +
+        `${entry.reason ?? entry.status ?? "failed"}` +
+        `${entry.reasonTag !== undefined ? ` [${entry.reasonTag}]` : ""}` +
+        `${entry.failureKinds !== undefined ? ` kinds=${entry.failureKinds.join(",")}` : ""}` +
+        `${entry.targetTable !== undefined ? ` table=${entry.targetTable}` : ""}` +
+        `${entry.cleanupFailures !== undefined ? ` cleanupFailures=${entry.cleanupFailures}` : ""}`),
+    ]),
     "",
     "| Table | Final live rows |", "| --- | ---: |",
     // Defense in depth: table names pass the soak vocabulary and counts

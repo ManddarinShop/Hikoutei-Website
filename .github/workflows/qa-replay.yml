@@ -1,0 +1,109 @@
+# QA replay — rerun the qa harness with a recorded seed (local-only, bounded).
+#
+# workflow_dispatch takes the QA_SEED from a qa-health lastFailure (or a QA
+# oracle failure issue) and replays the identical op sequence in a
+# throwaway ephemeral container: no sync env (local mode guaranteed), an
+# ephemeral DB on the container filesystem, and a loopback-published
+# health port. Prints the health JSON (seed, iterations, failures,
+# lastFailure, opCounters) so the replay verdict is in the log.
+#
+# Fidelity ceiling: the same seed replays the same sequence from step 0,
+# so a failure at step N replays only if the window reaches N steps
+# (~replay_seconds*1000/tick_ms steps; default 120s/20ms ~= 6000). Older
+# failures need a longer window. Local repro (qa/README.md):
+#   QA_SEED=<seed> QA_TICK_MS=20 node --experimental-strip-types qa/src/server.ts
+
+name: QA replay
+
+on:
+  workflow_dispatch:
+    inputs:
+      qa_seed:
+        description: "QA_SEED to replay (u32 integer from lastFailure)"
+        required: true
+      replay_seconds:
+        description: "How long to run the replay (10-600s)"
+        required: false
+        default: "120"
+      tick_ms:
+        description: "Step interval in ms (5-1000)"
+        required: false
+        default: "20"
+
+permissions:
+  contents: read
+
+# No concurrency gate here: a replay is a throwaway local-only container
+# that never touches the QA sheet, so it can overlap anything.
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Replay harness on the VM
+        uses: appleboy/ssh-action@v1
+        env:
+          QA_SEED: ${{ inputs.qa_seed }}
+          REPLAY_SECONDS: ${{ inputs.replay_seconds || '120' }}
+          TICK_MS: ${{ inputs.tick_ms || '20' }}
+        with:
+          host: ${{ secrets.DEMO_SSH_HOST }}
+          username: ${{ secrets.DEMO_SSH_USER }}
+          key: ${{ secrets.DEMO_SSH_KEY }}
+          envs: QA_SEED,REPLAY_SECONDS,TICK_MS
+          command_timeout: 15m
+          script: |
+            set -euo pipefail
+            cd /opt/hikoutei-website
+            case "$QA_SEED" in ''|*[!0-9]*)
+              echo "invalid qa_seed: must be a u32 integer"
+              exit 1
+              ;;
+            esac
+            if [ "$QA_SEED" -gt 4294967295 ]; then
+              echo "invalid qa_seed: must be a u32 integer"
+              exit 1
+            fi
+            case "$REPLAY_SECONDS" in ''|*[!0-9]*)
+              echo "invalid replay_seconds: must be an integer"
+              exit 1
+              ;;
+            esac
+            case "$TICK_MS" in ''|*[!0-9]*)
+              echo "invalid tick_ms: must be an integer"
+              exit 1
+              ;;
+            esac
+            if [ "$REPLAY_SECONDS" -lt 10 ] || [ "$REPLAY_SECONDS" -gt 600 ]; then
+              echo "replay_seconds must be 10..600"
+              exit 1
+            fi
+            if [ "$TICK_MS" -lt 5 ] || [ "$TICK_MS" -gt 1000 ]; then
+              echo "tick_ms must be 5..1000"
+              exit 1
+            fi
+            echo "replay ceiling: ~$(( REPLAY_SECONDS * 1000 / TICK_MS )) steps"
+            # Build only: never `up -d` the qa service here — a replay must
+            # not restart (or inherit the env of) the running service. The
+            # throwaway container below uses the built image tag directly.
+            docker compose -f demo/deploy/docker-compose.yml build qa >/dev/null 2>&1
+            QIMG=hikoutei-qa
+            # Throwaway local-only replay: no sync env passes, so the
+            # runtime boots local; the running qa service is untouched.
+            # Port 3219 is loopback-only, but concurrent replay runs share
+            # it — a second run fails at bind, so rerun after the first
+            # finishes instead of running two replays at once.
+            CID=$(docker run -d --rm -p 127.0.0.1:3219:3201 \
+              -e QA_SEED="$QA_SEED" \
+              -e QA_TICK_MS="$TICK_MS" \
+              -e QA_DB_PATH=/tmp/replay.sqlite \
+              -e QA_HISTORY_PATH=/tmp/replay-history.jsonl \
+              --entrypoint node "$QIMG" \
+              --experimental-strip-types src/server.ts)
+            trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
+            sleep "$REPLAY_SECONDS"
+            curl -fsS --max-time 20 http://127.0.0.1:3219/api/qa-health | python3 -m json.tool
+            echo "local repro: QA_SEED=$QA_SEED QA_TICK_MS=$TICK_MS node --experimental-strip-types qa/src/server.ts (see qa/README.md)"

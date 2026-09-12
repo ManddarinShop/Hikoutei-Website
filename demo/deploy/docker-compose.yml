@@ -23,7 +23,9 @@ services:
     build: ../../qa
     image: hikoutei-qa
     restart: unless-stopped
-    # Local-only fuzzing needs no secrets and no volumes (ephemeral DB).
+    # Local-only fuzzing needs no secrets. Verdict history (failures +
+    # periodic summaries) persists to ../data/qa — already gitignored
+    # runtime state — while the DB stays ephemeral (replay guarantee).
     # Memory-capped so a fuzz-found blowup cannot starve the demo.
     mem_limit: 768m
     environment:
@@ -33,6 +35,8 @@ services:
       QA_SA_JSON: ${QA_SA_JSON:-}
     expose:
       - "3201"
+    volumes:
+      - ../data/qa:/data:rw
     networks: [demo]
 
   caddy:

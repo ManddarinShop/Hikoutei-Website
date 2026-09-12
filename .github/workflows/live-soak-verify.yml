@@ -5,8 +5,17 @@
 # issues were filed from. Self-contained: builds the engine's own deps, runs
 # against /tmp state, writes an artifact summary that the workflow prints.
 #
-# Requires the QA sheet secrets (QA_SYNC_SPREADSHEET_URL, QA_SA_JSON) and the
-# SSH secrets — same set as demo-deploy.
+# Sheet isolation (Phase 3): the soak MUST run against the QA sheet
+# (QA_SYNC_SPREADSHEET_URL secret), NEVER the demo sheet. demo.env's
+# HIKOUTEI_SYNC_SPREADSHEET_URL belongs to the live demo server — sharing
+# one spreadsheet/sheet-key between the demo writer and the soak writer
+# broke exactly the human-lane scenarios while the baseline still
+# converged. The secret arrives via SSH env only and is never printed.
+#
+# Failure evidence (Phase 3): the run output is captured to a log file and
+# the redacted summary.json (fixed-vocabulary fields only — no ids, values,
+# or URLs) is printed with its failing-scenario detail, so a
+# `scenarios failures: N` result stays attributable from the workflow log.
 
 name: Live soak verification
 
@@ -17,6 +26,20 @@ on:
         description: "Run duration in hours (fractions OK, e.g. 0.02)"
         required: false
         default: "0.02"
+      seed:
+        description: "Soak seed, u32 integer (empty = engine default)"
+        required: false
+        default: ""
+  schedule:
+    # Nightly verification (02:30 UTC). Manual dispatch stays unchanged.
+    - cron: "30 2 * * *"
+
+# The QA sheet is a single-writer resource: live-soak and the sync
+# nightly must never overlap on it. Queue (never cancel) behind whoever
+# holds the sheet.
+concurrency:
+  group: qa-sheet
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -35,24 +58,57 @@ jobs:
       - name: Run live soak on the VM
         uses: appleboy/ssh-action@v1
         env:
-          DURATION: ${{ inputs.duration_hours || '0.02' }}
+          DURATION: ${{ github.event_name == 'schedule' && '0.3' || inputs.duration_hours || '0.02' }}
+          SOAK_SEED: ${{ github.event_name == 'schedule' && github.run_id || inputs.seed || '' }}
+          EVENT_NAME: ${{ github.event_name }}
+          QA_SHEET_URL: ${{ secrets.QA_SYNC_SPREADSHEET_URL }}
         with:
           host: ${{ secrets.DEMO_SSH_HOST }}
           username: ${{ secrets.DEMO_SSH_USER }}
           key: ${{ secrets.DEMO_SSH_KEY }}
-          envs: DURATION
+          envs: DURATION,SOAK_SEED,EVENT_NAME,QA_SHEET_URL
           command_timeout: 50m
           script: |
             set -euo pipefail
             cd /opt/hikoutei-website
+            # QA sheet only, fail closed: never fall back to demo.env's
+            # HIKOUTEI_SYNC_SPREADSHEET_URL (the live demo server's sheet).
+            if [ -z "${QA_SHEET_URL:-}" ]; then
+              echo "live-soak needs the QA_SYNC_SPREADSHEET_URL secret (refusing the demo sheet)"
+              exit 1
+            fi
+            export HIKOUTEI_SYNC_SPREADSHEET_URL="$QA_SHEET_URL"
             # Extract values WITHOUT sourcing: bash `source` strips the JSON
             # double quotes (VM bash 5.2 test-confirmed) and an unquoted
             # SA JSON is invalid. sed reads the raw line bytes.
-            export HIKOUTEI_SYNC_SPREADSHEET_URL=$(sed -n 's/^HIKOUTEI_SYNC_SPREADSHEET_URL=//p' demo/deploy/secrets/demo.env)
+            # (SA key only — the sheet URL above comes from Secrets, not demo.env.)
             mkdir -p /tmp/qa-sa
             sed -n 's/^DEMO_SA_JSON=//p' demo/deploy/secrets/demo.env > /tmp/qa-sa/sa.json
             python3 -m json.tool /tmp/qa-sa/sa.json > /dev/null
             export GOOGLE_APPLICATION_CREDENTIALS=/tmp/qa-sa/sa.json
+
+            # Seed: a schedule run folds run_id into u32 (a fresh
+            # deterministic batch every night, still replayable via the
+            # summary seed); a manual run passes --seed only when set, so
+            # the engine default still reproduces the exact historical runs.
+            SEED_ARGS=()
+            if [ -n "${SOAK_SEED:-}" ]; then
+              case "$SOAK_SEED" in ''|*[!0-9]*)
+                echo "invalid seed: must be a u32 integer"
+                exit 1
+                ;;
+              esac
+              # Force base 10: leading zeros are decimal digits, never an
+              # octal literal (bash arithmetic would misread e.g. 08).
+              SOAK_SEED=$(( 10#$SOAK_SEED ))
+              if [ "${EVENT_NAME:-}" = "schedule" ]; then
+                SOAK_SEED=$(( SOAK_SEED % 4294967296 ))
+              elif [ "$SOAK_SEED" -gt 4294967295 ]; then
+                echo "invalid seed: must be a u32 integer"
+                exit 1
+              fi
+              SEED_ARGS=(--seed "$SOAK_SEED")
+            fi
 
             # Clean-slate: remove leftover soak tabs from previous runs so the
             # verification run composes against a fresh sheet (run-to-run
@@ -76,6 +132,9 @@ jobs:
             # shells (compose env_file does not — that's why the demo works).
             # Write a key FILE and point GOOGLE_APPLICATION_CREDENTIALS at it
             # — the same auth shape the demo server uses.
+            mkdir -p /tmp/live-verify
+            rm -f /tmp/live-verify/run/summary.json
+            SOAK_EXIT=0
             docker run --rm \
               -e HIKOUTEI_SYNC_SPREADSHEET_URL="$HIKOUTEI_SYNC_SPREADSHEET_URL" \
               -e GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa.json \
@@ -84,5 +143,32 @@ jobs:
               --entrypoint node "$QIMG" \
               vendor/run-local-multitable-soak.mjs \
               --duration-hours "$DURATION" \
-              --output-dir /tmp/live-verify/run 2>&1 | tail -40
+              "${SEED_ARGS[@]}" \
+              --output-dir /tmp/live-verify/run > /tmp/live-verify/soak-output.log 2>&1 || SOAK_EXIT=$?
+            tail -40 /tmp/live-verify/soak-output.log
+            # Failure evidence: summary.json carries only fixed-vocabulary
+            # fields (counts plus the failing-scenario id/phase/reason —
+            # never ids, values, or URLs), so printing it is safe. The
+            # per-cycle JSONL stays on the VM.
+            python3 - <<'EOF'
+            import json
+            try:
+                with open('/tmp/live-verify/run/summary.json') as fh:
+                    s = json.load(fh)
+            except Exception as exc:
+                print('no summary.json: %s' % exc)
+            else:
+                print('result status=%s mode=%s seed=%s cycles=%s stop=%s' % (
+                    s.get('status'), s.get('mode'), s.get('seed'),
+                    s.get('cyclesCompleted'), s.get('stopReason')))
+                print('ops=%s convergence=%s scenarios=%s' % (
+                    json.dumps(s.get('operations'), sort_keys=True),
+                    json.dumps(s.get('convergence'), sort_keys=True),
+                    json.dumps(s.get('scenarios'), sort_keys=True)))
+                fails = s.get('scenarioFailures', [])
+                print('failing scenarios: %d' % len(fails))
+                for entry in fails:
+                    print(json.dumps(entry, sort_keys=True))
+            EOF
             rm -rf /tmp/qa-sa
+            exit $SOAK_EXIT
