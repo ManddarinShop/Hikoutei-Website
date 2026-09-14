@@ -1,0 +1,25 @@
+--- containers ---
+deploy-caddy-1 Up 3 days
+deploy-demo-server-1 Up 3 days (unhealthy)
+deploy-qa-1 Up 3 days
+ok: caddy deploy-caddy-1 running
+ok: demo-server deploy-demo-server-1 running
+ok: qa deploy-qa-1 running
+--- k3s ---
+ok: k3s not active
+--- port owners ---
+tcp6  0  0 :::443  :::*  LISTEN  1234/docker-proxy
+ok: :443 served via docker-proxy
+--- public edge ---
+DRIFT: public health does not report sync mode
+--- qa edge (wiring only) ---
+ok: qa-health reachable
+=== context: caddy tail ===
+{"level":"info","msg":"reverse proxying to demo-server:3101"}
+{"level":"error","msg":"dial tcp demo-server:3101: connect: connection refused"}
+=== context: demo-server tail (crash reason) ===
+HikouteiError (class=HikouteiError, code=sync_spreadsheet_access_denied)
+    at requireSheetAccess (server.js)
+Node.js v24.x — exited with code 1, restarting
+=== context: qa tail ===
+qa tick ok iterations=1043 failures=0

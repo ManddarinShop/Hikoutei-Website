@@ -13,6 +13,14 @@
 # different seed/step. The filing step below (if: failure()) re-reads the
 # saved payload and opens (or comments on) a "QA oracle failure" issue,
 # deduped per seed so a stuck oracle does not spam issues.
+#
+# Failure triage (LLM): the filing step feeds the qa payload + recent
+# metrics to the triage model and appends an "AI triage" section to the
+# issue body. Additive-only, silently skipped without TRIAGE_LLM_API_KEY.
+# QA oracle failures are rule-based P2 (label triage:P2).
+#
+# Dry-run: workflow_dispatch with triage_dry_run=true renders the issue
+# body from .github/triage-fixtures/ (no issue is filed).
 
 name: Health ping
 
@@ -20,10 +28,17 @@ on:
   schedule:
     - cron: "*/15 * * * *"
   workflow_dispatch:
+    inputs:
+      triage_dry_run:
+        description: "Render triage from fixtures without filing"
+        type: boolean
+        default: false
 
 # GITHUB_TOKEN needs issues:write for the QA failure filing step below.
-# No checkout, no other scopes: curl-only checks plus gh issue create/comment.
+# Read-only checkout supplies the triage script + metrics tail + fixtures;
+# the checks themselves stay curl-only with no other scopes.
 permissions:
+  contents: read
   issues: write
 
 jobs:
@@ -31,6 +46,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - uses: actions/checkout@v4
+
       - name: Require sync mode on the public edge
         run: |
           set -euo pipefail
@@ -60,14 +77,21 @@ jobs:
           EOF
 
       - name: File QA oracle failure issue
-        if: failure()
+        if: ${{ failure() || inputs.triage_dry_run }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TRIAGE_LLM_API_KEY: ${{ secrets.TRIAGE_LLM_API_KEY }}
+          TRIAGE_LLM_MODEL: ${{ vars.TRIAGE_LLM_MODEL }}
+          DRY_RUN: ${{ inputs.triage_dry_run }}
         run: |
           set -euo pipefail
           # Scoped to QA: a demo-only edge failure still fails this workflow
           # (loud page) but must not file a QA oracle issue.
           payload=$(cat "$RUNNER_TEMP/qa-health.json" 2>/dev/null || curl -fsS --max-time 25 https://hikoutei.cloud/api/qa-health || echo '{}')
+          if [ "${DRY_RUN}" = "true" ]; then
+            payload=$(cat .github/triage-fixtures/qa-sample.json)
+            export TRIAGE_FIXTURE_RESPONSE=.github/triage-fixtures/llm-sample-response.json
+          fi
           printf '%s' "$payload" > /tmp/qa-payload.json
           python3 - <<'EOF'
           import json
@@ -111,6 +135,30 @@ jobs:
             echo "no QA oracle failure in payload — demo-only failure, skipping issue"
             exit 0
           fi
+          # Failure triage (LLM, additive-only): appends an "AI triage"
+          # section to the body when the key is present and the model
+          # returns valid JSON; otherwise the body stays as-is.
+          tail -7 ops/metrics.csv > /tmp/metrics-tail.csv 2>/dev/null || true
+          gh issue list -R ManddarinShop/Hikoutei-Website --state open \
+            --json number,title --limit 50 > /tmp/open-issues.json 2>/dev/null \
+            || echo '[]' > /tmp/open-issues.json
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo '[]' > /tmp/open-issues.json
+          fi
+          .github/scripts/llm-triage.sh --mode qa --evidence /tmp/qa-payload.json \
+            --metrics /tmp/metrics-tail.csv --open-issues /tmp/open-issues.json \
+            --out /tmp/triage.md || true
+          if [ -f /tmp/triage.md ]; then
+            { echo; cat /tmp/triage.md; } >> /tmp/qa-body.md
+          fi
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "--- dry-run title ---"; cat /tmp/qa-title.txt; echo
+            echo "--- dry-run body ---"; cat /tmp/qa-body.md
+            exit 0
+          fi
+          gh label create "triage:P2" -R ManddarinShop/Hikoutei-Website \
+            --color "0e8a16" --description "LLM-triaged QA oracle failure" \
+            2>/dev/null || true
           seed=$(cat /tmp/qa-seed.txt)
           expected=$(cat /tmp/qa-title.txt)
           existing=$(gh issue list -R ManddarinShop/Hikoutei-Website --state open --json number,title --limit 50)
@@ -124,6 +172,8 @@ jobs:
           if [ -n "$match" ]; then
             echo "open issue #$match already tracks seed $seed — commenting only"
             gh issue comment "$match" -R ManddarinShop/Hikoutei-Website --body-file /tmp/qa-body.md
+            gh issue edit "$match" -R ManddarinShop/Hikoutei-Website \
+              --add-label "triage:P2" 2>/dev/null || true
           else
-            gh issue create -R ManddarinShop/Hikoutei-Website --title "$(cat /tmp/qa-title.txt)" --body-file /tmp/qa-body.md
+            gh issue create -R ManddarinShop/Hikoutei-Website --title "$(cat /tmp/qa-title.txt)" --label "triage:P2" --body-file /tmp/qa-body.md
           fi

@@ -14,9 +14,21 @@
 #      which files the "QA oracle failure" issue; drift-watch must not
 #      double-page on an oracle failure, only on an unreachable qa)
 #
-# Any mismatch fails the workflow (GitHub notifies). The VM user needs
-# passwordless sudo for the listener check; without it step 3 errors loud
-# instead of silently passing.
+# Any mismatch fails the check (GitHub notifies) AND files/updates an
+# "Infra drift detected" issue via the triage job below, so the failure is
+# tracked, not just mailed. The VM user needs passwordless sudo for the
+# listener check; without it step 3 errors loud instead of silently passing.
+#
+# Failure triage (LLM): the triage job feeds the ssh output + recent
+# metrics to the triage model and appends an "AI triage" section (severity
+# + RCA hypothesis + remediation) to the issue. The model only ADDS
+# context — it can never suppress paging, and without TRIAGE_LLM_API_KEY
+# the triage step silently skips while issue filing continues unchanged.
+# Severity is rule-based, not model-based: P1 = edge/k3s/container/port,
+# P2 = qa wiring only. Labels triage:P1/triage:P2, [P1] title prefix.
+#
+# Dry-run: workflow_dispatch with triage_dry_run=true skips SSH and renders
+# the issue body from .github/triage-fixtures/ (no issue is filed).
 
 name: Drift watch
 
@@ -24,9 +36,21 @@ on:
   schedule:
     - cron: "0 3 * * *"
   workflow_dispatch:
+    inputs:
+      triage_dry_run:
+        description: "Render triage from fixtures without SSH or filing"
+        type: boolean
+        default: false
+
+# GITHUB_TOKEN needs issues:write for drift-issue filing, contents:read
+# for the checkout in the triage job.
+permissions:
+  contents: read
+  issues: write
 
 jobs:
   check:
+    if: ${{ !inputs.triage_dry_run }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -37,6 +61,7 @@ jobs:
           username: ${{ secrets.DEMO_SSH_USER }}
           key: ${{ secrets.DEMO_SSH_KEY }}
           script: |
+            {
             set -euo pipefail
             fail=0
 
@@ -116,3 +141,115 @@ jobs:
               exit 1
             fi
             echo "drift check clean"
+            } > /tmp/hikoutei-drift-last.log 2>&1; rc=$?
+            cat /tmp/hikoutei-drift-last.log
+            exit $rc
+
+  triage:
+    needs: check
+    if: ${{ always() && (needs.check.result == 'failure' || inputs.triage_dry_run) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch evidence
+        id: evidence
+        env:
+          DRY_RUN: ${{ inputs.triage_dry_run }}
+        run: |
+          set -euo pipefail
+          if [ "${DRY_RUN}" = "true" ]; then
+            cp .github/triage-fixtures/drift-sample.log ./drift.log
+            echo "dry-run: fixture evidence, no SSH, nothing filed below"
+          else
+            mkdir -p ~/.ssh
+            printf '%s' "${{ secrets.DEMO_SSH_KEY }}" > ~/.ssh/drift_key
+            chmod 600 ~/.ssh/drift_key
+            scp -o StrictHostKeyChecking=no -o ConnectTimeout=20 \
+              -i ~/.ssh/drift_key \
+              "${{ secrets.DEMO_SSH_USER }}@${{ secrets.DEMO_SSH_HOST }}:/tmp/hikoutei-drift-last.log" \
+              ./drift.log
+            rm -f ~/.ssh/drift_key
+          fi
+          grep -c '^DRIFT:' ./drift.log
+
+      - name: File or update drift issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TRIAGE_LLM_API_KEY: ${{ secrets.TRIAGE_LLM_API_KEY }}
+          TRIAGE_LLM_MODEL: ${{ vars.TRIAGE_LLM_MODEL }}
+          DRY_RUN: ${{ inputs.triage_dry_run }}
+        run: |
+          set -euo pipefail
+          if [ "${DRY_RUN}" = "true" ]; then
+            export TRIAGE_FIXTURE_RESPONSE=.github/triage-fixtures/llm-sample-response.json
+          fi
+          drift_lines=$(grep '^DRIFT:' ./drift.log || true)
+          # Rule-based severity (deterministic, never model-based): anything
+          # beyond qa-wiring-only is P1.
+          if echo "$drift_lines" | grep -Eq 'public health|container missing|k3s is active|:443 not served|k8s listener'; then
+            sev="P1"; label="triage:P1"; prefix="[P1] "
+          else
+            sev="P2"; label="triage:P2"; prefix=""
+          fi
+          sig=$(printf '%s' "$drift_lines" | sort | sha256sum | cut -c1-8)
+          title="${prefix}Infra drift detected — ${sig}"
+          printf '%s' "$title" > /tmp/drift-title.txt
+
+          tail -7 ops/metrics.csv > /tmp/metrics-tail.csv 2>/dev/null || true
+          gh issue list -R ManddarinShop/Hikoutei-Website --state open \
+            --json number,title --limit 50 > /tmp/open-issues.json 2>/dev/null \
+            || echo '[]' > /tmp/open-issues.json
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo '[]' > /tmp/open-issues.json
+          fi
+          .github/scripts/llm-triage.sh --mode drift --evidence ./drift.log \
+            --metrics /tmp/metrics-tail.csv --open-issues /tmp/open-issues.json \
+            --out /tmp/triage.md || true
+
+          {
+            echo "Infra drift detected by the Drift watch workflow (run ${GITHUB_RUN_ID})."
+            echo
+            echo "Severity (rule-based): **${sev}**"
+            echo
+            echo '## DRIFT lines'
+            echo '```'
+            printf '%s\n' "$drift_lines"
+            echo '```'
+            echo
+            echo '## Evidence tail (ssh output)'
+            echo '```'
+            tail -40 ./drift.log
+            echo '```'
+            if [ -f /tmp/triage.md ]; then
+              echo
+              cat /tmp/triage.md
+            fi
+          } > /tmp/drift-body.md
+
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "--- dry-run title ---"; cat /tmp/drift-title.txt; echo
+            echo "--- dry-run body ---"; cat /tmp/drift-body.md
+            exit 0
+          fi
+          gh label create "$label" -R ManddarinShop/Hikoutei-Website \
+            --color "d73a4a" --description "LLM-triaged infra drift" \
+            2>/dev/null || true
+          expected=$(cat /tmp/drift-title.txt)
+          match=$(python3 -c '
+          import json, sys
+          issues = json.load(open("/tmp/open-issues.json"))
+          print(next((str(i["number"]) for i in issues
+                      if i.get("title", "") == sys.argv[1]), ""))
+          ' "$expected")
+          if [ -n "$match" ]; then
+            echo "open issue #$match already tracks this drift — commenting only"
+            gh issue comment "$match" -R ManddarinShop/Hikoutei-Website \
+              --body-file /tmp/drift-body.md
+            gh issue edit "$match" -R ManddarinShop/Hikoutei-Website \
+              --add-label "$label" 2>/dev/null || true
+          else
+            gh issue create -R ManddarinShop/Hikoutei-Website \
+              --title "$expected" --label "$label" --body-file /tmp/drift-body.md
+          fi
