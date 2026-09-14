@@ -55,7 +55,6 @@ import json, os, re, subprocess, sys, urllib.request
 mode, evidence_path, out_path, metrics_path, issues_path, model = sys.argv[1:7]
 endpoint = os.environ.get(
     "TRIAGE_LLM_ENDPOINT", "https://opencode.ai/zen/v1/responses")
-dry_run = os.environ.get("TRIAGE_FIXTURE_RESPONSE", "") != ""
 
 def read_capped(path, limit=12000):
     try:
@@ -133,8 +132,12 @@ def extract_text(api):
 
 try:
     api, status = call_llm()
-    if dry_run:
-        print(f"triage llm http status: {status}", flush=True)
+except Exception as e:
+    api, status = None, "error:" + type(e).__name__
+# Status only (a number or error tag, never the key): printed live too so
+# the first real failure is diagnosable from the workflow log.
+print(f"triage llm http status: {status}", flush=True)
+try:
     if api is None:
         raise ValueError(f"llm http {status}")
     text = extract_text(api).strip()
