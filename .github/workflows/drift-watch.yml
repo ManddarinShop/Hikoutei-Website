@@ -29,6 +29,8 @@
 #
 # Dry-run: workflow_dispatch with triage_dry_run=true skips SSH and renders
 # the issue body from .github/triage-fixtures/ (no issue is filed).
+# Live probe: workflow_dispatch with live_probe=true makes ONE real LLM
+# call on fixture evidence (verifies the registered key) and files nothing.
 
 name: Drift watch
 
@@ -41,6 +43,10 @@ on:
         description: "Render triage from fixtures without SSH or filing"
         type: boolean
         default: false
+      live_probe:
+        description: "One live LLM call on fixture evidence (uses the key, files nothing)"
+        type: boolean
+        default: false
 
 # GITHUB_TOKEN needs issues:write for drift-issue filing, contents:read
 # for the checkout in the triage job.
@@ -50,7 +56,7 @@ permissions:
 
 jobs:
   check:
-    if: ${{ !inputs.triage_dry_run }}
+    if: ${{ !inputs.triage_dry_run && !inputs.live_probe }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -147,7 +153,7 @@ jobs:
 
   triage:
     needs: check
-    if: ${{ always() && (needs.check.result == 'failure' || inputs.triage_dry_run) }}
+    if: ${{ always() && (needs.check.result == 'failure' || inputs.triage_dry_run || inputs.live_probe) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -157,11 +163,12 @@ jobs:
         id: evidence
         env:
           DRY_RUN: ${{ inputs.triage_dry_run }}
+          PROBE: ${{ inputs.live_probe }}
         run: |
           set -euo pipefail
-          if [ "${DRY_RUN}" = "true" ]; then
+          if [ "${DRY_RUN}" = "true" ] || [ "${PROBE}" = "true" ]; then
             cp .github/triage-fixtures/drift-sample.log ./drift.log
-            echo "dry-run: fixture evidence, no SSH, nothing filed below"
+            echo "fixture evidence, no SSH, nothing filed below"
           else
             mkdir -p ~/.ssh
             printf '%s' "${{ secrets.DEMO_SSH_KEY }}" > ~/.ssh/drift_key
@@ -180,10 +187,14 @@ jobs:
           TRIAGE_LLM_API_KEY: ${{ secrets.TRIAGE_LLM_API_KEY }}
           TRIAGE_LLM_MODEL: ${{ vars.TRIAGE_LLM_MODEL }}
           DRY_RUN: ${{ inputs.triage_dry_run }}
+          PROBE: ${{ inputs.live_probe }}
         run: |
           set -euo pipefail
           if [ "${DRY_RUN}" = "true" ]; then
             export TRIAGE_FIXTURE_RESPONSE=.github/triage-fixtures/llm-sample-response.json
+          fi
+          if [ "${PROBE}" = "true" ]; then
+            echo "live probe: one real LLM call with the registered key"
           fi
           drift_lines=$(grep '^DRIFT:' ./drift.log || true)
           # Rule-based severity (deterministic, never model-based): anything
@@ -228,9 +239,9 @@ jobs:
             fi
           } > /tmp/drift-body.md
 
-          if [ "${DRY_RUN}" = "true" ]; then
-            echo "--- dry-run title ---"; cat /tmp/drift-title.txt; echo
-            echo "--- dry-run body ---"; cat /tmp/drift-body.md
+          if [ "${DRY_RUN}" = "true" ] || [ "${PROBE}" = "true" ]; then
+            echo "--- title ---"; cat /tmp/drift-title.txt; echo
+            echo "--- body ---"; cat /tmp/drift-body.md
             exit 0
           fi
           gh label create "$label" -R ManddarinShop/Hikoutei-Website \
