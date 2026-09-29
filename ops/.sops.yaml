@@ -1,0 +1,6 @@
+# sops age recipient: VM deploy key (private key lives ONLY at
+# /etc/hikoutei-ops/age.key on the VM, mode 600). Ciphertext in
+# ops/secrets/ is committable; plaintext must never be committed.
+creation_rules:
+  - path_regex: ops/secrets/[^/]+$
+    age: age1xrjxzwyzsaavnz8nz609k9wf0sertgrjql9a7925fepgu7tfhdtqkqhgm4
