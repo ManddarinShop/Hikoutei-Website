@@ -1,0 +1,34 @@
+# One-way migration: GitHub Secrets -> sops ciphertext in ops/secrets/.
+# Run once via Actions UI (or `gh workflow run sops-rotate`), verify the
+# committed files are ciphertext, then keep for future rotations.
+# Plaintext exists only inside this job and is never committed.
+name: sops-rotate
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  rotate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install sops (pinned)
+        run: |
+          curl -fsSL -o /tmp/sops https://github.com/getsops/sops/releases/download/v3.10.2/sops-v3.10.2.linux.amd64
+          chmod +x /tmp/sops
+          /tmp/sops --version
+      - name: Encrypt secrets to ops/secrets/
+        run: |
+          mkdir -p ops/secrets
+          printf '%s' '${{ secrets.OPENCODE_ZEN_API_KEY }}' > ops/secrets/zen_key.txt
+          printf '%s' '${{ secrets.HIKOUTEI_PR_TOKEN }}' > ops/secrets/pr_token.txt
+          /tmp/sops --encrypt --in-place ops/secrets/zen_key.txt ops/secrets/pr_token.txt
+          grep -q "ENC\[" ops/secrets/zen_key.txt && grep -q "ENC\[" ops/secrets/pr_token.txt
+          echo "ciphertext ok"
+      - name: Commit ciphertext
+        run: |
+          git config user.name "ManddarinShop"
+          git config user.email "bot@manddarin.shop"
+          git add ops/secrets/zen_key.txt ops/secrets/pr_token.txt
+          git commit -m "chore(secrets): rotate sops ciphertext" && git push || echo "nothing to push"
