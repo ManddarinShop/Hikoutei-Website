@@ -54,37 +54,61 @@ def allowed(name: str) -> bool:
     return any(name == a or (a.endswith("*") and name.startswith(a[:-1])) for a in ALLOW)
 
 
-def check() -> list[tuple[str, str, str]]:
-    """Return [(kind, key, detail)] incidents."""
+def check() -> list[dict]:
+    """Return [{kind, key, detail, ...}] incidents."""
     found = []
     for label, url in (("demo", DEMO_HEALTH), ("qa", QA_HEALTH)):
         try:
             body = get_json(url)
             if not body.get("ok", False):
-                found.append((f"{label}_down", label, f"{url} ok=false: {json.dumps(body)[:300]}"))
+                found.append({"kind": f"{label}_down", "key": label,
+                              "detail": f"{url} ok=false: {json.dumps(body)[:300]}"})
         except Exception as e:
-            found.append((f"{label}_down", label, f"{url} unreachable: {qw._redact(str(e))[:200]}"))
+            found.append({"kind": f"{label}_down", "key": label,
+                          "detail": f"{url} unreachable: {qw._redact(str(e))[:200]}"})
     if shutil.disk_usage("/").used * 100 // shutil.disk_usage("/").total >= DISK_LIMIT:
-        found.append(("disk", "root", f"disk usage over {DISK_LIMIT}%"))
+        found.append({"kind": "disk", "key": "root", "detail": f"disk usage over {DISK_LIMIT}%"})
     for c in docker_ps():
         if ("Restarting" in c["status"] or "Exited" in c["status"]) and allowed(c["name"]):
-            found.append(("container", c["name"], f"{c['name']} {c['status']}"))
+            found.append({"kind": "container", "key": c["name"],
+                          "detail": f"{c['name']} {c['status']}"})
     try:
         pending = r.xpending("q:fix", "workers") or {}
         if (pending.get("min_idle_time") or 0) > 30 * 60 * 1000:
-            found.append(("q_stuck", "qfix", "q:fix task idle over 30m"))
+            found.append({"kind": "q_stuck", "key": "qfix", "detail": "q:fix task idle over 30m"})
     except redis.ResponseError:
+        pass
+    try:  # library CI on our fix branches (needs PAT Checks:read)
+        prs = qw.gh("GET", f"/repos/{qw.GH_REPO}/pulls?state=open&per_page=50")
+        for pr in prs:
+            head = (pr.get("head") or {}).get("ref", "")
+            sha = (pr.get("head") or {}).get("sha", "")
+            if not head.startswith("fix/qa-") or not sha:
+                continue
+            runs = qw.gh("GET", f"/repos/{qw.GH_REPO}/commits/{sha}/check-runs?per_page=20")
+            crs = runs.get("check_runs", [])
+            if not crs:
+                continue
+            if all(c.get("conclusion") in ("success", "skipped", "neutral") for c in crs):
+                continue
+            if any(c.get("conclusion") == "failure" for c in crs):
+                found.append({"kind": "ci_fail", "key": f"{head}@{sha[:8]}",
+                              "detail": f"CI failed on {head}@{sha[:8]}",
+                              "branch": head, "sha": sha})
+    except Exception:
         pass
     return found
 
 
-def raise_incidents(found: list[tuple[str, str, str]]) -> None:
-    for kind, key, detail in found:
-        dk = f"q:infra:dedupe:{kind}:{key}"
+def raise_incidents(found: list[dict]) -> None:
+    for inc in found:
+        dk = f"q:infra:dedupe:{inc['kind']}:{inc['key']}"
         if r.set(dk, "1", nx=True, ex=3600):
-            r.xadd("q:infra", {"kind": kind, "key": key, "detail": detail,
+            r.xadd("q:infra", {"kind": inc["kind"], "key": inc["key"],
+                               "detail": inc["detail"],
+                               "branch": inc.get("branch", ""), "sha": inc.get("sha", ""),
                                "ts": str(int(time.time()))})
-            print(json.dumps({"incident": kind, "key": key}), flush=True)
+            print(json.dumps({"incident": inc["kind"], "key": inc["key"]}), flush=True)
 
 
 PROMPT = (
@@ -100,6 +124,15 @@ PROMPT = (
 def process(msg_id: str, f: dict) -> bool:
     t0 = time.time()
     verdict = {"infra_task": f.get("kind"), "key": f.get("key"), "model": MODEL}
+    if f.get("kind") == "ci_fail":  # hand to fix workers with CI context
+        dd = f"ci-{f.get('sha', '')[:12]}"
+        if r.set(f"q:dedupe:{dd}", "1", nx=True, ex=7 * 86400):
+            r.xadd("q:fix", {"kind": "rework", "dedupe": dd,
+                             "branch": f.get("branch", ""), "sha": f.get("sha", ""),
+                             "detail": f.get("detail", "")})
+        verdict.update(status="handed_off")
+        print(json.dumps(verdict), flush=True)
+        return True
     if not AUTO:
         qw.file_issue(f"infra: {f.get('kind')} {f.get('key')}: {f.get('detail', '')}", "", "")
         verdict.update(status="issue_only")
@@ -114,7 +147,7 @@ def process(msg_id: str, f: dict) -> bool:
                           timeout=600, env=env, capture_output=True, text=True)
     ok = proc.returncode == 0
     # verify: re-run checks for the same kind
-    still = [k for k, _, _ in check() if k == f.get("kind")]
+    still = [i for i in check() if i["kind"] == f.get("kind")]
     verdict.update(status="recovered" if ok and not still else "still_down",
                    latency_s=round(time.time() - t0, 1))
     print(json.dumps(verdict), flush=True)
