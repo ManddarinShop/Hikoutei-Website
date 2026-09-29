@@ -47,6 +47,41 @@ def _redact(text: str) -> str:
     return text
 
 
+def _get_text(path: str, limit: int = 6000) -> str:
+    req = urllib.request.Request(
+        "https://api.github.com" + path,
+        headers={"Authorization": f"Bearer {os.environ['PAT']}",
+                 "Accept": "application/vnd.github+json"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read().decode("utf-8", "replace")[-limit:]
+
+
+def ci_failed_logs(sha: str, limit: int = 8000) -> str:
+    """Failed CI job logs for a commit. Needs PAT Actions:read; degrades gracefully."""
+    try:
+        runs = gh("GET", f"/repos/{GH_REPO}/actions/runs?head_sha={sha}&per_page=5")
+    except Exception:
+        return "(CI run list unavailable: PAT needs Actions read permission)"
+    texts = []
+    for wr in (runs or {}).get("workflow_runs", []):
+        try:
+            jobs = gh("GET", f"/repos/{GH_REPO}/actions/runs/{wr['id']}/jobs?per_page=30")
+        except Exception:
+            continue
+        for j in jobs.get("jobs", []):
+            if j.get("conclusion") != "failure":
+                continue
+            try:
+                logs = _get_text(f"/repos/{GH_REPO}/actions/jobs/{j['id']}/logs", 4000)
+            except Exception as e:
+                logs = f"(log fetch failed: {e})"
+            texts.append(f"### {wr.get('name')} / {j.get('name')}\n{logs}")
+            if sum(map(len, texts)) > limit:
+                break
+    return "\n".join(texts)[:limit] if texts else "(no failed jobs found)"
+
+
 def file_issue(detail: str, seed: str, step: str) -> None:
     h = sig(detail)
     if find_issue(h):

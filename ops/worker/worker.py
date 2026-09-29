@@ -63,27 +63,41 @@ def _ahead(wt: str, branch: str) -> int:
 
 
 def process(msg_id: str, f: dict) -> bool:
-    dedupe, seed, step = f["dedupe"], f.get("seed", ""), f.get("step", "")
-    branch = f"fix/qa-{dedupe[:12]}"
+    is_rework = f.get("kind") == "rework"
+    dedupe = f["dedupe"]
+    seed, step = f.get("seed", ""), f.get("step", "")
+    branch = f["branch"] if is_rework else f"fix/qa-{dedupe[:12]}"
     wt = f"/work/wt-{dedupe[:12]}"
     t0 = time.time()
-    verdict = {"task": dedupe, "model": MODEL}
+    verdict = {"task": dedupe, "model": MODEL, "kind": f.get("kind", "fix")}
 
     sh("git", "-C", LIB, "worktree", "prune", check=False)
     subprocess.run(["rm", "-rf", wt], check=False)
-    sh("git", "-C", LIB, "fetch", "-q", "origin", "main", timeout=300)
-    out = sh("git", "-C", LIB, "worktree", "add", "-b", branch, wt, "origin/main", check=False)
-    if out.returncode != 0:  # branch exists from a previous attempt -> resume it
+    if is_rework:
+        sh("git", "-C", LIB, "fetch", "-q", "origin", f"{branch}:{branch}", timeout=300)
         sh("git", "-C", LIB, "worktree", "add", wt, branch)
+    else:
+        sh("git", "-C", LIB, "fetch", "-q", "origin", "main", timeout=300)
+        out = sh("git", "-C", LIB, "worktree", "add", "-b", branch, wt, "origin/main", check=False)
+        if out.returncode != 0:  # branch exists from a previous attempt -> resume it
+            sh("git", "-C", LIB, "worktree", "add", wt, branch)
 
     porcelain = sh("git", "-C", wt, "status", "--porcelain").stdout.strip()
-    if not porcelain and _ahead(wt, branch) == 0:
+    prompt = ""
+    if is_rework:
+        logs = qw.ci_failed_logs(f.get("sha", ""))
+        prompt = (
+            "CI failed on this branch. Fix minimally, working-tree files only, no commits.\n"
+            f"Branch={branch} failing_sha={f.get('sha', '')}\nCI logs:\n{logs}"
+        )
+    elif not porcelain and _ahead(wt, branch) == 0:
         prompt = (
             "Fix the bug below in this repo (minimal diff, no refactoring, "
             "edit working-tree files only, no branches/commits).\n"
             f"QA failure: {f.get('detail', '')}\nseed={seed} step={step} op={f.get('op', '')}\n"
             "Do not run builds or test suites (too heavy here); keep the change obviously correct."
         )
+    if prompt:
         auth = {"opencode": {"type": "api", "key": os.environ["ZEN_KEY"]}}
         env = dict(os.environ, OPENCODE_AUTH_CONTENT=json.dumps(auth))
         proc = subprocess.run(["opencode", "run", "--auto", "--model", MODEL, prompt],
