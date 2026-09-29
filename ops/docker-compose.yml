@@ -1,0 +1,40 @@
+# Ops stack: log collection (Vector -> Loki) + task queue (Redis Streams).
+#
+# Deployed directly on the VM for now (`docker compose up -d` in this dir).
+# Wiring into a deploy workflow comes after the stack proves stable.
+#
+# Ports are NOT published: consumers (watcher/worker) will join this
+# compose network. Use `docker exec` for debugging (logcli, redis-cli).
+name: hikoutei-ops
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    volumes:
+      - redis-data:/data
+    expose:
+      - "6379"
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:3.4.2
+    command: ["-config.file=/etc/loki/loki.yml"]
+    volumes:
+      - loki-data:/loki
+      - ./loki.yml:/etc/loki/loki.yml:ro
+    expose:
+      - "3100"
+    restart: unless-stopped
+
+  vector:
+    image: timberio/vector:0.47.0-alpine
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./vector.toml:/etc/vector/vector.toml:ro
+    depends_on:
+      - loki
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  loki-data:
