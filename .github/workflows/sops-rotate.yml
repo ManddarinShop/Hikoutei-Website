@@ -23,7 +23,7 @@ jobs:
           mkdir -p ops/secrets
           printf '%s' '${{ secrets.OPENCODE_ZEN_API_KEY }}' > ops/secrets/zen_key.txt
           printf '%s' '${{ secrets.HIKOUTEI_PR_TOKEN }}' > ops/secrets/pr_token.txt
-          /tmp/sops --encrypt --in-place ops/secrets/zen_key.txt ops/secrets/pr_token.txt
+          for f in ops/secrets/zen_key.txt ops/secrets/pr_token.txt; do /tmp/sops --encrypt --in-place "$f"; done
           grep -q "ENC\[" ops/secrets/zen_key.txt && grep -q "ENC\[" ops/secrets/pr_token.txt
           echo "ciphertext ok"
       - name: Commit ciphertext
