@@ -1,0 +1,14 @@
+# Vector: docker container logs -> Loki. v1 ships raw lines with
+# container/stream labels; verdict extraction moves here later.
+[sources.docker]
+type = "docker_logs"
+
+[sinks.loki]
+type = "loki"
+inputs = ["docker"]
+endpoint = "http://loki:3100"
+encoding.codec = "json"
+
+[sinks.loki.labels]
+container = "{{ container_name }}"
+stream = "{{ stream }}"
