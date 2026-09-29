@@ -3,7 +3,12 @@
 At-least-once + idempotent: branch fix/qa-<dedupe>, PR created only if
 no open PR exists for the head branch. Stale leases reclaimed via XAUTOCLAIM.
 Attempts > 3 -> DLQ stream + issue, then ack.
+
+Secrets hygiene: PAT/ZEN never appear in logs. GitHub git-over-HTTPS
+uses Basic auth (x-access-token), NOT Bearer. Exceptions are redacted
+before printing.
 """
+import base64
 import json
 import os
 import socket
@@ -22,6 +27,22 @@ LIB = "/work/lib"
 LEASE_MS = int(os.environ.get("LEASE_MS", "1200000"))  # 20 min
 MAX_ATTEMPTS = 3
 
+_SECRETS: list[str] = []
+
+
+def _redact(text: str) -> str:
+    for s in _SECRETS + [os.environ.get("PAT", ""), os.environ.get("ZEN_KEY", "")]:
+        if s:
+            text = text.replace(s, "***")
+    return text
+
+
+def _git_auth_args() -> list[str]:
+    basic = base64.b64encode(f"x-access-token:{os.environ['PAT']}".encode()).decode()
+    _SECRETS.append(basic)
+    return ["-c", f"http.extraHeader=AUTHORIZATION: basic {basic}"]
+
+
 r = redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=30)
 print(f"worker {NAME} up, model={MODEL}", flush=True)
 try:
@@ -32,6 +53,7 @@ except redis.ResponseError as e:
 
 
 def sh(*args, cwd=None, timeout=120, env=None, check=True):
+    env = {"GIT_TERMINAL_PROMPT": "0", **(env or os.environ)}
     return subprocess.run(args, cwd=cwd, timeout=timeout, env=env,
                           capture_output=True, text=True, check=check)
 
@@ -39,6 +61,15 @@ def sh(*args, cwd=None, timeout=120, env=None, check=True):
 def open_pr(branch: str):
     prs = qw.gh("GET", f"/repos/{qw.GH_REPO}/pulls?head=ManddarinShop:{branch}&state=open")
     return prs[0]["html_url"] if prs else None
+
+
+def _ahead(wt: str, branch: str) -> int:
+    remote = sh("git", "-C", wt, "ls-remote", "--heads", "origin", branch,
+                check=False).stdout.strip()
+    base = branch if remote else "origin/main"
+    out = sh("git", "-C", wt, "rev-list", "--count", f"{base}..HEAD",
+             check=False).stdout.strip()
+    return int(out or 0)
 
 
 def process(msg_id: str, f: dict) -> bool:
@@ -52,37 +83,45 @@ def process(msg_id: str, f: dict) -> bool:
     subprocess.run(["rm", "-rf", wt], check=False)
     sh("git", "-C", LIB, "fetch", "-q", "origin", "main", timeout=300)
     out = sh("git", "-C", LIB, "worktree", "add", "-b", branch, wt, "origin/main", check=False)
-    if out.returncode != 0:  # branch may exist from a previous attempt
+    if out.returncode != 0:  # branch exists from a previous attempt -> resume it
         sh("git", "-C", LIB, "worktree", "add", wt, branch)
 
-    prompt = (
-        "Fix the bug below in this repo (minimal diff, no refactoring, "
-        "edit working-tree files only, no branches/commits).\n"
-        f"QA failure: {f.get('detail', '')}\nseed={seed} step={step} op={f.get('op', '')}\n"
-        "Do not run builds or test suites (too heavy here); keep the change obviously correct."
-    )
-    auth = {"opencode": {"type": "api", "key": os.environ["ZEN_KEY"]}}
-    env = dict(os.environ, OPENCODE_AUTH_CONTENT=json.dumps(auth))
-    proc = subprocess.run(["opencode", "run", "--auto", "--model", MODEL, prompt],
-                          cwd=wt, timeout=600, env=env,
-                          capture_output=True, text=True)
-    if proc.returncode != 0:
-        verdict.update(status="opencode_failed", latency_s=round(time.time() - t0, 1))
-        print(json.dumps(verdict), flush=True)
-        return False
+    porcelain = sh("git", "-C", wt, "status", "--porcelain").stdout.strip()
+    if not porcelain and _ahead(wt, branch) == 0:
+        prompt = (
+            "Fix the bug below in this repo (minimal diff, no refactoring, "
+            "edit working-tree files only, no branches/commits).\n"
+            f"QA failure: {f.get('detail', '')}\nseed={seed} step={step} op={f.get('op', '')}\n"
+            "Do not run builds or test suites (too heavy here); keep the change obviously correct."
+        )
+        auth = {"opencode": {"type": "api", "key": os.environ["ZEN_KEY"]}}
+        env = dict(os.environ, OPENCODE_AUTH_CONTENT=json.dumps(auth))
+        proc = subprocess.run(["opencode", "run", "--auto", "--model", MODEL, prompt],
+                              cwd=wt, timeout=600, env=env,
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            verdict.update(status="opencode_failed", latency_s=round(time.time() - t0, 1))
+            print(json.dumps(verdict), flush=True)
+            return False
+        porcelain = sh("git", "-C", wt, "status", "--porcelain").stdout.strip()
+        if not porcelain:
+            pr_url = open_pr(branch)  # fix landed earlier and PR exists -> adopt
+            if pr_url:
+                verdict.update(status="pr_adopted", pr_url=pr_url,
+                               latency_s=round(time.time() - t0, 1))
+                print(json.dumps(verdict), flush=True)
+                sh("git", "-C", LIB, "worktree", "remove", "--force", wt, check=False)
+                return True
+            verdict.update(status="no_change", latency_s=round(time.time() - t0, 1))
+            print(json.dumps(verdict), flush=True)
+            return False
 
-    changed = sh("git", "-C", wt, "status", "--porcelain").stdout.strip()
-    if not changed:
-        verdict.update(status="no_change", latency_s=round(time.time() - t0, 1))
-        print(json.dumps(verdict), flush=True)
-        return False
-
-    sh("git", "-C", wt, "add", "-A")
-    sh("git", "-C", wt, "commit", "-m",
-       f"fix(qa): {f.get('detail', '')[:80]} (seed={seed} step={step})")
-    pat = os.environ["PAT"]
-    sh("git", "-C", wt, "-c", "http.extraHeader=AUTHORIZATION: bearer " + pat,
-       "push", "-u", "origin", branch, timeout=300)
+    if porcelain:
+        sh("git", "-C", wt, "add", "-A")
+        sh("git", "-C", wt, "commit", "-m",
+           f"fix(qa): {f.get('detail', '')[:80]} (seed={seed} step={step})")
+    sh("git", "-C", wt, *_git_auth_args(),
+       "push", "--set-upstream", "origin", branch, timeout=300)
 
     pr_url = open_pr(branch)
     if not pr_url:
@@ -123,7 +162,7 @@ def main() -> None:
                     ok = process(mid, fields)
                 except Exception as e:  # reclaim later; never lose the task
                     print(json.dumps({"task": fields.get("dedupe"), "status": "error",
-                                      "error": str(e)[:200]}), flush=True)
+                                      "error": _redact(str(e))[:200]}), flush=True)
                     continue
                 if ok:
                     r.delete(f"q:att:{fields['dedupe']}")
