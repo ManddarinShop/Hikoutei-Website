@@ -16,7 +16,8 @@ QA_FILE = os.environ.get("QA_FILE", "/qa/qa-history.jsonl")
 POS_KEY = "q:watcher:pos"
 PREFIXES = [p for p in os.environ.get("AUTO_PR_PREFIXES", "").split("\n") if p]
 
-r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+r = redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=30)
+print(f"watcher up, file={QA_FILE}, prefixes={len(PREFIXES)}", flush=True)
 
 
 def handle(rec: dict) -> None:
