@@ -37,6 +37,36 @@ services:
       - loki
     restart: unless-stopped
 
+  watcher:
+    build: ./worker
+    environment:
+      ROLE: watcher
+      REDIS_URL: redis://redis:6379/0
+      QA_FILE: /qa/qa-history.jsonl
+      GH_REPO: ManddarinShop/Hikoutei
+      AUTO_PR_PREFIXES: "QARecord user_input projection is blocked: delete is blocked by an unresolved User_Input candidate."
+    volumes:
+      - /opt/hikoutei-website/demo/data/qa:/qa:ro
+      - /etc/hikoutei-ops/age.key:/etc/hikoutei-ops/age.key:ro
+      - ./secrets:/sops:ro
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  worker:
+    build: ./worker
+    environment:
+      ROLE: worker
+      REDIS_URL: redis://redis:6379/0
+      GH_REPO: ManddarinShop/Hikoutei
+      MODEL: opencode/muse-spark-1.3-contributor-free
+    volumes:
+      - /etc/hikoutei-ops/age.key:/etc/hikoutei-ops/age.key:ro
+      - ./secrets:/sops:ro
+    depends_on:
+      - redis
+    restart: unless-stopped
+
 volumes:
   redis-data:
   loki-data:
