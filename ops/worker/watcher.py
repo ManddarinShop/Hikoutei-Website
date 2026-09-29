@@ -35,7 +35,13 @@ def handle(rec: dict) -> None:
 
 
 def main() -> None:
-    pos = int(r.get(POS_KEY) or 0)
+    pos_raw = r.get(POS_KEY)
+    if pos_raw is None:
+        # First run: skip history, only new failures flow in (QA ticks every 5s).
+        pos = os.path.getsize(QA_FILE) if os.path.exists(QA_FILE) else 0
+        r.set(POS_KEY, pos)
+    else:
+        pos = int(pos_raw)
     while True:
         try:
             size = os.path.getsize(QA_FILE)
