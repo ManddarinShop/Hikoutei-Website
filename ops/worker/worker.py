@@ -22,7 +22,8 @@ LIB = "/work/lib"
 LEASE_MS = int(os.environ.get("LEASE_MS", "1200000"))  # 20 min
 MAX_ATTEMPTS = 3
 
-r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+r = redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=30)
+print(f"worker {NAME} up, model={MODEL}", flush=True)
 try:
     r.xgroup_create("q:fix", GROUP, mkstream=True)
 except redis.ResponseError as e:
@@ -111,7 +112,10 @@ def main() -> None:
         try:
             claimed = r.xautoclaim("q:fix", GROUP, NAME, LEASE_MS, "0-0", count=5)
             batch = [(mid, fields) for mid, fields in claimed[1]]
-            fresh = r.xreadgroup(GROUP, NAME, {"q:fix": ">"}, count=5, block=10000)
+            try:
+                fresh = r.xreadgroup(GROUP, NAME, {"q:fix": ">"}, count=5, block=10000)
+            except redis.TimeoutError:
+                continue  # block interval elapsed, no new tasks
             for _, msgs in fresh or []:
                 batch += msgs
             for mid, fields in batch:
