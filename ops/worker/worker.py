@@ -27,19 +27,9 @@ LIB = "/work/lib"
 LEASE_MS = int(os.environ.get("LEASE_MS", "1200000"))  # 20 min
 MAX_ATTEMPTS = 3
 
-_SECRETS: list[str] = []
-
-
-def _redact(text: str) -> str:
-    for s in _SECRETS + [os.environ.get("PAT", ""), os.environ.get("ZEN_KEY", "")]:
-        if s:
-            text = text.replace(s, "***")
-    return text
-
-
 def _git_auth_args() -> list[str]:
     basic = base64.b64encode(f"x-access-token:{os.environ['PAT']}".encode()).decode()
-    _SECRETS.append(basic)
+    qw._register_secret(basic)
     return ["-c", f"http.extraHeader=AUTHORIZATION: basic {basic}"]
 
 
@@ -162,7 +152,7 @@ def main() -> None:
                     ok = process(mid, fields)
                 except Exception as e:  # reclaim later; never lose the task
                     print(json.dumps({"task": fields.get("dedupe"), "status": "error",
-                                      "error": _redact(str(e))[:200]}), flush=True)
+                                      "error": qw._redact(str(e))[:200]}), flush=True)
                     continue
                 if ok:
                     r.delete(f"q:att:{fields['dedupe']}")

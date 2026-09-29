@@ -67,6 +67,33 @@ services:
       - redis
     restart: unless-stopped
 
+  conductor:
+    build: ./worker
+    environment:
+      ROLE: conductor
+      REDIS_URL: redis://redis:6379/0
+      GH_REPO: ManddarinShop/Hikoutei
+      MODEL: opencode/muse-spark-1.3-contributor-free
+      DEMO_HEALTH: http://demo-server:3101/api/health
+      QA_HEALTH: http://qa:3201/api/qa-health
+      INFRA_ALLOW: "deploy-demo-server-1,deploy-qa-1,deploy-caddy-1,hikoutei-ops-*"
+      INFRA_AUTO_RESTART: "1"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /etc/hikoutei-ops/age.key:/etc/hikoutei-ops/age.key:ro
+      - ./secrets:/sops:ro
+    networks:
+      - default
+      - demo
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+networks:
+  demo:
+    external: true
+    name: deploy_demo
+
 volumes:
   redis-data:
   loki-data:

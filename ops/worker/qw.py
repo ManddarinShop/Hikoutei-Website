@@ -31,6 +31,22 @@ def find_issue(sig_hash: str):
     return res.get("items", [{}])[0].get("number") if res.get("total_count") else None
 
 
+_SECRETS: list[str] = []
+
+
+def _register_secret(s: str) -> None:
+    if s:
+        _SECRETS.append(s)
+
+
+def _redact(text: str) -> str:
+    import os as _os
+    for s in _SECRETS + [_os.environ.get("PAT", ""), _os.environ.get("ZEN_KEY", "")]:
+        if s:
+            text = text.replace(s, "***")
+    return text
+
+
 def file_issue(detail: str, seed: str, step: str) -> None:
     h = sig(detail)
     if find_issue(h):
