@@ -87,13 +87,17 @@ def process(msg_id: str, f: dict) -> bool:
     if is_rework:
         logs = qw.ci_failed_logs(f.get("sha", ""))
         prompt = (
-            "CI failed on this branch. Fix minimally, working-tree files only, no commits.\n"
+            "CI failed on this branch. Fix forward minimally, working-tree files only, no commits.\n"
+            "NEVER revert prior commits on this branch just to green CI; "
+            "if the failure looks unrelated to this branch, change nothing and say so.\n"
+            "See git log for prior fix attempts on this branch.\n"
             f"Branch={branch} failing_sha={f.get('sha', '')}\nCI logs:\n{logs}"
         )
     elif not porcelain and _ahead(wt, branch) == 0:
         prompt = (
             "Fix the bug below in this repo (minimal diff, no refactoring, "
             "edit working-tree files only, no branches/commits).\n"
+            "NEVER submit an empty or revert-only change.\n"
             f"QA failure: {f.get('detail', '')}\nseed={seed} step={step} op={f.get('op', '')}\n"
             "Do not run builds or test suites (too heavy here); keep the change obviously correct."
         )
@@ -122,10 +126,28 @@ def process(msg_id: str, f: dict) -> bool:
 
     if porcelain:
         sh("git", "-C", wt, "add", "-A")
-        sh("git", "-C", wt, "commit", "-m",
-           f"fix(qa): {f.get('detail', '')[:80]} (seed={seed} step={step})")
+        if seed or step:
+            msg = f"fix(qa): {f.get('detail', '')[:80]} (seed={seed} step={step})"
+        else:
+            msg = f"fix(qa): rework {branch} for CI ({f.get('sha', '')[:8]})"
+        sh("git", "-C", wt, "commit", "-m", msg)
     sh("git", "-C", wt, *_git_auth_args(),
        "push", "--set-upstream", "origin", branch, timeout=300)
+
+    net = sh("git", "-C", wt, "diff", "--stat", f"origin/main...{branch}",
+             check=False).stdout.strip()
+    if not net:  # fix cancelled out (e.g. revert) -> never ship green-but-empty
+        pr_url = open_pr(branch)
+        if pr_url:
+            num = pr_url.rstrip("/").split("/")[-1]
+            qw.gh("POST", f"/repos/{qw.GH_REPO}/issues/{num}/comments",
+                  {"body": "Auto-closing: branch net-diff vs main is empty."})
+            qw.gh("PATCH", f"/repos/{qw.GH_REPO}/pulls/{num}", {"state": "closed"})
+        qw.file_issue(f"empty net-diff on {branch}, not shipped", "", "")
+        verdict.update(status="empty_guarded", latency_s=round(time.time() - t0, 1))
+        print(json.dumps(verdict), flush=True)
+        sh("git", "-C", LIB, "worktree", "remove", "--force", wt, check=False)
+        return True
 
     pr_url = open_pr(branch)
     if not pr_url:
