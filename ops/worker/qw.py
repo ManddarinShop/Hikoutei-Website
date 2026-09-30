@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -26,11 +27,24 @@ def gh(method: str, path: str, body=None):
 
 
 def find_issue(sig_hash: str):
-    # NB: quote the whole query with urlencode; quote() would turn the
-    # space separators into %2B and GitHub answers 422 (crashed the watcher).
+    # Search API answers 422 to fine-grained PATs (verified live), so try
+    # search first (works for classic tokens) and fall back to listing.
     q = urllib.parse.urlencode({"q": f"repo:{GH_REPO} in:title SIG:{sig_hash}"})
-    res = gh("GET", f"/search/issues?{q}")
-    return res.get("items", [{}])[0].get("number") if res.get("total_count") else None
+    try:
+        res = gh("GET", f"/search/issues?{q}")
+        if res.get("total_count"):
+            return res["items"][0]["number"]
+    except urllib.error.HTTPError:
+        pass
+    needle = f"SIG:{sig_hash}"
+    for page in range(1, 6):
+        issues = gh("GET", f"/repos/{GH_REPO}/issues?state=open&per_page=100&page={page}")
+        if not issues:
+            break
+        for it in issues:
+            if needle in (it.get("title") or ""):
+                return it["number"]
+    return None
 
 
 _SECRETS: list[str] = []
