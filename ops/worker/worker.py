@@ -168,7 +168,11 @@ def fail(task_id: str, f: dict) -> None:
     r.expire(f"q:att:{f['dedupe']}", 86400)
     if n > MAX_ATTEMPTS:
         r.xadd("q:fix:dlq", f)
-        qw.file_issue(f.get("detail", ""), f.get("seed", ""), f.get("step", ""))
+        try:
+            qw.file_issue(f.get("detail", ""), f.get("seed", ""), f.get("step", ""))
+        except Exception as e:
+            print(json.dumps({"task": f.get("dedupe"), "status": "issue_failed",
+                              "error": qw._redact(str(e))[:200]}), flush=True)
         r.xack("q:fix", GROUP, task_id)
 
 

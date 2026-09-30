@@ -56,7 +56,13 @@ def main() -> None:
                     except json.JSONDecodeError:
                         continue
                     if rec.get("type") == "failure":
-                        handle(rec)
+                        try:
+                            handle(rec)
+                        except Exception as e:
+                            # One poison record must never stall the tail:
+                            # log, skip, keep advancing.
+                            print(json.dumps({"status": "record_error",
+                                              "error": str(e)[:200]}), flush=True)
                 pos = f.tell()
             r.set(POS_KEY, pos)
         except FileNotFoundError:
