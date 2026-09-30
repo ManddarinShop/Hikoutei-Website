@@ -152,7 +152,11 @@ def process(msg_id: str, f: dict) -> bool:
                    latency_s=round(time.time() - t0, 1))
     print(json.dumps(verdict), flush=True)
     if verdict["status"] == "still_down":
-        qw.file_issue(f"infra: {f.get('kind')} {f.get('key')} still down. {f.get('detail', '')[:200]}", "", "")
+        try:
+            qw.file_issue(f"infra: {f.get('kind')} {f.get('key')} still down. {f.get('detail', '')[:200]}", "", "")
+        except Exception as e:
+            print(json.dumps({"infra_task": f.get("kind"), "status": "issue_failed",
+                              "error": qw._redact(str(e))[:200]}), flush=True)
     return True
 
 

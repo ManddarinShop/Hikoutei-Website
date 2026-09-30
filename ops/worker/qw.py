@@ -26,8 +26,10 @@ def gh(method: str, path: str, body=None):
 
 
 def find_issue(sig_hash: str):
-    q = urllib.parse.quote(f"repo:{GH_REPO} in:title SIG:{sig_hash}")
-    res = gh("GET", f"/search/issues?q={q}")
+    # NB: quote the whole query with urlencode; quote() would turn the
+    # space separators into %2B and GitHub answers 422 (crashed the watcher).
+    q = urllib.parse.urlencode({"q": f"repo:{GH_REPO} in:title SIG:{sig_hash}"})
+    res = gh("GET", f"/search/issues?{q}")
     return res.get("items", [{}])[0].get("number") if res.get("total_count") else None
 
 
