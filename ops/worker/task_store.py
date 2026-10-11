@@ -317,6 +317,22 @@ if event_exists then return {'duplicate'} end
 return {'stored'}
 """
 
+_READ_QUEUE_SNAPSHOT = r"""
+local registry_type = redis.call('TYPE', KEYS[1]).ok
+local queue_type = redis.call('TYPE', KEYS[2]).ok
+if registry_type ~= 'none' and registry_type ~= 'hash' then return {'queue_registry_wrong_type'} end
+if queue_type ~= 'none' and queue_type ~= 'stream' then return {'queue_wrong_type'} end
+if queue_type == 'none' and registry_type == 'hash' and redis.call('HLEN', KEYS[1]) > 0 then
+  return {'queue_registry_without_queue'}
+end
+local registrations = {}
+if registry_type == 'hash' then registrations = redis.call('HGETALL', KEYS[1]) end
+local entries = {}
+if queue_type == 'stream' then entries = redis.call('XRANGE', KEYS[2], '-', '+') end
+return {'snapshot', registrations, entries, redis.call('TIME')}
+"""
+
+
 class TaskStore:
     """Own only `ops:v2:*`; cursor-CAS scripts repair partial writes on retry."""
 
@@ -395,6 +411,93 @@ class TaskStore:
             CURSOR_KEY, self._expected(expected), cursor, event, identity, advance=True,
         )
 
+    def queued_ids(self) -> list[str]:
+        """Discover queued and expired leases from one consistent registry/stream snapshot."""
+        reply = self._client.eval(_READ_QUEUE_SNAPSHOT, 2, QUEUE_REGISTRY_KEY, QUEUE_KEY)
+        status = self._reply_status(reply)
+        if status in ("queue_registry_wrong_type", "queue_wrong_type", "queue_registry_without_queue"):
+            raise TaskStoreError(status)
+        if status != "snapshot" or not isinstance(reply, (list, tuple)) or len(reply) != 4:
+            raise TaskStoreError("queue_snapshot_invalid")
+        raw_registry, raw_entries, raw_time = reply[1:]
+        if (
+            not isinstance(raw_registry, (list, tuple)) or len(raw_registry) % 2 != 0
+            or not isinstance(raw_entries, (list, tuple))
+            or not isinstance(raw_time, (list, tuple)) or len(raw_time) != 2
+        ):
+            raise TaskStoreError("queue_snapshot_invalid")
+        try:
+            seconds, microseconds = (int(self._snapshot_text(value)) for value in raw_time)
+        except (TaskStoreError, ValueError):
+            raise TaskStoreError("queue_snapshot_invalid") from None
+        if seconds < 0 or not 0 <= microseconds < 1_000_000:
+            raise TaskStoreError("queue_snapshot_invalid")
+        now_ms = seconds * 1000 + microseconds // 1000
+
+        registrations: dict[str, str] = {}
+        for index in range(0, len(raw_registry), 2):
+            task_id = self._snapshot_text(raw_registry[index])
+            registration = self._snapshot_text(raw_registry[index + 1])
+            try:
+                task_key(task_id)
+            except TaskStoreError:
+                raise TaskStoreError("queue_invalid_registration") from None
+            if task_id in registrations or (
+                registration != "__pending__" and re.fullmatch(r"[0-9]+-[0-9]+", registration) is None
+            ):
+                raise TaskStoreError("queue_invalid_registration")
+            registrations[task_id] = registration
+
+        entries_by_task: dict[str, str] = {}
+        # ponytail: full stream reads are O(n); paginate only if registrations grow materially.
+        for entry in raw_entries:
+            if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+                raise TaskStoreError("queue_invalid_registration")
+            stream_id = self._snapshot_text(entry[0])
+            raw_fields = entry[1]
+            if (
+                re.fullmatch(r"[0-9]+-[0-9]+", stream_id) is None
+                or not isinstance(raw_fields, (list, tuple)) or len(raw_fields) != 2
+            ):
+                raise TaskStoreError("queue_invalid_registration")
+            field_name = self._snapshot_text(raw_fields[0])
+            task_id = self._snapshot_text(raw_fields[1])
+            try:
+                task_key(task_id)
+            except TaskStoreError:
+                raise TaskStoreError("queue_invalid_registration") from None
+            if task_id in entries_by_task:
+                raise TaskStoreError("queue_duplicate_registration")
+            registration = registrations.get(task_id)
+            if registration is None or registration not in ("__pending__", stream_id):
+                raise TaskStoreError("queue_invalid_registration")
+            if field_name != "task_id":
+                raise TaskStoreError("queue_invalid_registration")
+            entries_by_task[task_id] = stream_id
+
+        if len(entries_by_task) != len(registrations):
+            raise TaskStoreError("queue_invalid_registration")
+        if any(
+            task_id not in entries_by_task
+            or (registration != "__pending__" and registration != entries_by_task[task_id])
+            for task_id, registration in registrations.items()
+        ):
+            raise TaskStoreError("queue_invalid_registration")
+
+        candidates: list[str] = []
+        for task_id in entries_by_task:
+            snapshot = self._read_task_snapshot(task_id)
+            if snapshot is None:
+                # Surface matching partial registrations so cursor replay can repair ingress.
+                candidates.append(task_id)
+                continue
+            task = snapshot[1]
+            if task["status"] == "queued" or (
+                task["status"] == "investigating" and task["lease_until_ms"] <= now_ms
+            ):
+                candidates.append(task_id)
+        return candidates
+
     def _initialize_cursor(self, key: str, serialized: str) -> CursorInitializationResult:
         """Share SETNX initialization while keeping the QA and CI cursor keys separate."""
         reply = self._client.eval(_INITIALIZE_CURSOR, 1, key, serialized)
@@ -469,6 +572,17 @@ class TaskStore:
     @staticmethod
     def _text(value: object) -> str:
         return value.decode("utf-8") if isinstance(value, bytes) else str(value)
+
+    @staticmethod
+    def _snapshot_text(value: object) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, bytes):
+            try:
+                return value.decode("utf-8")
+            except UnicodeDecodeError:
+                raise TaskStoreError("queue_invalid_registration") from None
+        raise TaskStoreError("queue_invalid_registration")
 
     @staticmethod
     def _expected(snapshot: AnyCursorSnapshot) -> str:
