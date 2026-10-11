@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -26,25 +27,97 @@ def gh(method: str, path: str, body=None):
         return json.load(r) if r.status != 204 else None
 
 
-def find_issue(sig_hash: str):
-    # Search API answers 422 to fine-grained PATs (verified live), so try
-    # search first (works for classic tokens) and fall back to listing.
-    q = urllib.parse.urlencode({"q": f"repo:{GH_REPO} in:title SIG:{sig_hash}"})
-    try:
-        res = gh("GET", f"/search/issues?{q}")
-        if res.get("total_count"):
-            return res["items"][0]["number"]
-    except urllib.error.HTTPError:
-        pass
-    needle = f"SIG:{sig_hash}"
-    for page in range(1, 6):
-        issues = gh("GET", f"/repos/{GH_REPO}/issues?state=open&per_page=100&page={page}")
-        if not issues:
-            break
-        for it in issues:
-            if needle in (it.get("title") or ""):
-                return it["number"]
-    return None
+class IssueLookupError(RuntimeError):
+    """A GitHub lookup failure that must not be treated as an absent issue."""
+
+    domain = "github_issue_lookup"
+
+    def __init__(self, code: str, message: str, *, http_status: int | None = None):
+        super().__init__(message)
+        self.code = code
+        self.http_status = http_status
+
+
+def find_issue(sig_hash: str, repo: str | None = None) -> int | None:
+    """Return a matching open or closed issue, or None after a complete listing."""
+    repository = GH_REPO if repo is None else repo
+    parts = repository.split("/") if isinstance(repository, str) else []
+    if len(parts) != 2 or not all(parts):
+        raise IssueLookupError("invalid_repository", "GitHub repository must be owner/name")
+
+    seen_numbers: set[int] = set()
+    sig_marker = re.compile(rf"SIG:{re.escape(sig_hash)}(?![0-9A-Fa-f])")
+    legacy_marker = f"[qa-failure {sig_hash}]"
+    page = 1
+    while True:
+        path = (
+            f"/repos/{urllib.parse.quote(parts[0], safe='')}/"
+            f"{urllib.parse.quote(parts[1], safe='')}/issues?"
+            f"{urllib.parse.urlencode({'state': 'all', 'per_page': 100, 'page': page})}"
+        )
+        try:
+            issues = gh("GET", path)
+        except Exception as exc:
+            status = exc.code if isinstance(exc, urllib.error.HTTPError) else None
+            if isinstance(exc, urllib.error.HTTPError):
+                exc.close()
+            raise IssueLookupError(
+                "request_failed", "GitHub issue listing request failed", http_status=status
+            ) from exc
+
+        if not isinstance(issues, list) or len(issues) > 100:
+            raise IssueLookupError("invalid_response", f"GitHub issue page {page} was malformed")
+
+        page_number_set: set[int] = set()
+        page_issues: list[tuple[int, str | None]] = []
+        for issue in issues:
+            if not isinstance(issue, dict):
+                raise IssueLookupError("invalid_issue", f"Malformed issue on page {page}")
+            number = issue.get("number")
+            if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+                raise IssueLookupError("invalid_issue", f"Malformed issue number on page {page}")
+            if number in page_number_set:
+                raise IssueLookupError("pagination_stalled", f"Duplicate issue on page {page}")
+            page_number_set.add(number)
+
+            if "pull_request" in issue:
+                if not isinstance(issue["pull_request"], dict):
+                    raise IssueLookupError("invalid_issue", f"Malformed pull request on page {page}")
+                page_issues.append((number, None))
+                continue
+
+            title = issue.get("title")
+            state = issue.get("state")
+            url = issue.get("html_url")
+            try:
+                parsed_url = urllib.parse.urlsplit(url) if isinstance(url, str) else None
+            except ValueError:
+                parsed_url = None
+            if (
+                not isinstance(title, str)
+                or not title
+                or state not in ("open", "closed")
+                or parsed_url is None
+                or parsed_url.scheme != "https"
+                or parsed_url.netloc != "github.com"
+                or parsed_url.path.rstrip("/").rsplit("/", 2)[-2:] != ["issues", str(number)]
+            ):
+                raise IssueLookupError("invalid_issue", f"Malformed issue on page {page}")
+            page_issues.append((number, title))
+
+        if not page_number_set:
+            return None
+        if not page_number_set.difference(seen_numbers):
+            raise IssueLookupError("pagination_stalled", f"GitHub issue pagination stalled at page {page}")
+        seen_numbers.update(page_number_set)
+
+        for number, title in page_issues:
+            if title is not None and (legacy_marker in title or sig_marker.search(title)):
+                return number
+
+        if len(issues) < 100:
+            return None
+        page += 1
 
 
 _SECRETS: list[str] = []
@@ -100,7 +173,7 @@ def ci_failed_logs(sha: str, limit: int = 8000) -> str:
 
 def file_issue(detail: str, seed: str, step: str) -> None:
     h = sig(detail)
-    if find_issue(h):
+    if find_issue(h) is not None:
         return  # one issue per signature; no comment spam in v1
     gh("POST", f"/repos/{GH_REPO}/issues", {
         "title": f"[qa-failure {h}] {detail[:100]}",
