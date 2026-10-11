@@ -6,8 +6,9 @@ import json
 import re
 from typing import Any, Literal, TypeAlias, TypedDict, cast
 from task_contracts import (
-    Cursor, CursorValidation, EventValidation, StoredEvent,
-    stable_json, validate_cursor, validate_stored_event,
+    Cursor, CursorValidation, EventValidation, FailureOccurrence, IncidentIdentity,
+    QueuedTask, StoredEvent, TaskState, TaskValidation, queued_task, stable_json,
+    validate_cursor, validate_stored_event, validate_task,
 )
 
 PREFIX = "ops:v2:"
@@ -135,12 +136,207 @@ if existed then return {'duplicate'} end
 return {'stored'}
 """
 
+_INGEST_FAILURE = r"""
+local function keytype(key)
+  return redis.call('TYPE', key).ok
+end
+local roles = {'cursor', 'occurrence', 'task', 'queue', 'queue_registry', 'observations'}
+local expected = {'string', 'string', 'string', 'stream', 'hash', 'zset'}
+if ARGV[12] ~= '0' and ARGV[12] ~= '1' then return {'invalid_state'} end
+for i = 1, #KEYS do
+  local actual = keytype(KEYS[i])
+  if actual ~= 'none' and actual ~= expected[i] then return {'wrong_type', roles[i]} end
+end
+local function exact_keys(value, expected_keys)
+  local count = 0
+  for key, _ in pairs(value) do
+    if not expected_keys[key] then return false end
+    count = count + 1
+  end
+  local expected_count = 0
+  for key, _ in pairs(expected_keys) do
+    if value[key] == nil then return false end
+    expected_count = expected_count + 1
+  end
+  return count == expected_count
+end
+local MAX_SAFE_COUNTER = 2147483647
+local MAX_SAFE_TIMESTAMP_MS = 99999999999999
+local function nonnegative_integer(value)
+  return type(value) == 'number' and value >= 0 and value == math.floor(value)
+end
+local function safe_timestamp_ms(value)
+  return nonnegative_integer(value) and value <= MAX_SAFE_TIMESTAMP_MS
+end
+local function current_time_ms()
+  local time = redis.call('TIME')
+  local seconds = tonumber(time[1])
+  local microseconds = tonumber(time[2])
+  if not nonnegative_integer(seconds) or not nonnegative_integer(microseconds)
+      or microseconds >= 1000000 then return nil end
+  local now_ms = seconds * 1000 + math.floor(microseconds / 1000)
+  if not safe_timestamp_ms(now_ms) then return nil end
+  return now_ms
+end
+local function safe_counter(value)
+  return nonnegative_integer(value) and value <= MAX_SAFE_COUNTER
+end
+local function valid_task(value, task_id, source_repo, category, component, mode, error_family)
+  if type(value) ~= 'table' or value.schema_version ~= 2 or value.id ~= task_id
+      or value.source_repo ~= source_repo or value.category ~= category
+      or value.component ~= component or value.mode ~= mode
+      or value.error_family ~= error_family then return false end
+  local extras = {
+    queued = {}, investigating = {owner=true, lease_until_ms=true},
+    blocked = {reason_code=true, blocked_at_ms=true}
+  }
+  local extra = extras[value.status]
+  if not extra then return false end
+  local fields = {
+    schema_version=true, id=true, source_repo=true, category=true, component=true,
+    mode=true, error_family=true, attempts=true, epoch=true, revision=true,
+    created_at_ms=true, updated_at_ms=true, error=true, status=true
+  }
+  local count = 0
+  for key, _ in pairs(extra) do fields[key] = true end
+  for key, _ in pairs(value) do
+    if not fields[key] then return false end
+    count = count + 1
+  end
+  local expected_count = 14
+  for _, _ in pairs(extra) do expected_count = expected_count + 1 end
+  if count ~= expected_count then return false end
+  if value.source_repo ~= 'ManddarinShop/Hikoutei' and value.source_repo ~= 'ManddarinShop/Hikoutei-Website' then return false end
+  if type(value.category) ~= 'string' or value.category == '' or #value.category > 128
+      or type(value.component) ~= 'string' or value.component == '' or #value.component > 128
+      or type(value.error_family) ~= 'string' or value.error_family == '' or #value.error_family > 128
+      or (value.mode ~= 'local' and value.mode ~= 'sync' and value.mode ~= 'unknown') then return false end
+  for _, field in ipairs({'attempts', 'epoch', 'revision'}) do
+    if not safe_counter(value[field]) then return false end
+  end
+  for _, field in ipairs({'created_at_ms', 'updated_at_ms'}) do
+    if not safe_timestamp_ms(value[field]) then return false end
+  end
+  if type(value.error) ~= 'table' then return false end
+  if value.error.status == 'none' then
+    if not exact_keys(value.error, {status=true}) then return false end
+  elseif value.error.status == 'recorded' then
+    if not exact_keys(value.error, {status=true, code=true, at_ms=true})
+        or type(value.error.code) ~= 'string' or #value.error.code > 64
+        or not string.match(value.error.code, '^[a-z][a-z0-9_]*$')
+        or not safe_timestamp_ms(value.error.at_ms) then return false end
+  else
+    return false
+  end
+  if value.status == 'investigating' then
+    if type(value.owner) ~= 'string' or value.owner == '' or #value.owner > 128
+        or not safe_timestamp_ms(value.lease_until_ms) then return false end
+  elseif value.status == 'blocked' then
+    if type(value.reason_code) ~= 'string' or #value.reason_code > 64
+        or not string.match(value.reason_code, '^[a-z][a-z0-9_]*$')
+        or not safe_timestamp_ms(value.blocked_at_ms) then return false end
+  end
+  return true
+end
+-- A previous runtime error may have followed XADD but preceded the registry update.
+local function find_stream_registration(task_id)
+  local entries = redis.call('XRANGE', KEYS[4], '-', '+')
+  local found
+  for _, entry in ipairs(entries) do
+    local fields = entry[2]
+    if #fields ~= 2 or fields[1] ~= 'task_id' then return nil, false end
+    if fields[2] == task_id then
+      if found then return nil, false end
+      found = entry[1]
+    end
+  end
+  return found, true
+end
+local current_cursor = redis.call('GET', KEYS[1])
+if ARGV[1] == '' then
+  if current_cursor then return {'stale_cursor'} end
+elseif current_cursor ~= ARGV[1] then
+  return {'stale_cursor'}
+end
+local event_exists = keytype(KEYS[2]) == 'string'
+local task_exists = keytype(KEYS[3]) == 'string'
+local task
+if task_exists then
+  local raw_task = redis.call('GET', KEYS[3])
+  local ok
+  ok, task = pcall(cjson.decode, raw_task)
+  if not ok or not valid_task(task, ARGV[6], ARGV[7], ARGV[8], ARGV[9], ARGV[10], ARGV[11]) then
+    return {'invalid_state'}
+  end
+else
+  local ok, prototype = pcall(cjson.decode, ARGV[4])
+  if not ok or not valid_task(prototype, ARGV[6], ARGV[7], ARGV[8], ARGV[9], ARGV[10], ARGV[11])
+      or prototype.status ~= 'queued' then
+    return {'invalid_state'}
+  end
+  task = prototype
+end
+if event_exists and redis.call('GET', KEYS[2]) ~= ARGV[3] then return {'invalid_state'} end
+local registration = redis.call('HGET', KEYS[5], ARGV[6])
+local stream_id
+if registration and registration ~= '__pending__' then
+  if not string.match(registration, '^%d+%-%d+$') then return {'invalid_state'} end
+  local entries = redis.call('XRANGE', KEYS[4], registration, registration)
+  if #entries ~= 1 then return {'invalid_state'} end
+  local fields = entries[1][2]
+  if #fields ~= 2 or fields[1] ~= 'task_id' or fields[2] ~= ARGV[6] then
+    return {'invalid_state'}
+  end
+  stream_id = registration
+elseif registration == '__pending__' then
+  local valid
+  stream_id, valid = find_stream_registration(ARGV[6])
+  if not valid then return {'invalid_state'} end
+end
+local now_ms = current_time_ms()
+if now_ms == nil then return {'timestamp_out_of_range'} end
+local encoded_task
+if not task_exists then
+  task.created_at_ms = now_ms
+  task.updated_at_ms = now_ms
+  encoded_task = cjson.encode(task)
+end
+if not event_exists then redis.call('SET', KEYS[2], ARGV[3]) end
+-- Lua runtime errors do not roll back; the marker makes a partial XADD retry idempotent.
+if not registration then
+  redis.call('HSET', KEYS[5], ARGV[6], '__pending__')
+end
+if not stream_id then
+  stream_id = redis.call('XADD', KEYS[4], '*', 'task_id', ARGV[6])
+end
+if registration ~= stream_id then redis.call('HSET', KEYS[5], ARGV[6], stream_id) end
+redis.call('ZADD', KEYS[6], now_ms, ARGV[5])
+if not task_exists then redis.call('SET', KEYS[3], encoded_task) end
+if ARGV[12] == '1' then redis.call('SET', KEYS[1], ARGV[2]) end
+if event_exists then return {'duplicate'} end
+return {'stored'}
+"""
 
 class TaskStore:
-    """Own only QA cursor and observation state in the v2 namespace."""
+    """Own only `ops:v2:*`; cursor-CAS scripts repair partial writes on retry."""
 
     def __init__(self, client: Any):
         self._client = client
+
+    def load_task(self, task_id: str) -> TaskState | None:
+        """Load one durable task only after strict lifecycle validation."""
+        snapshot = self._read_task_snapshot(task_id)
+        return None if snapshot is None else snapshot[1]
+
+    def observation_ids(self, task_id: str) -> list[str]:
+        """Return retained occurrence IDs for an incident task."""
+        key = observations_key(task_id)
+        key_type = self._text(self._client.type(key))
+        if key_type == "none":
+            return []
+        if key_type != "zset":
+            raise TaskStoreError("observations_wrong_type")
+        return list(self._client.zrange(key, 0, -1))
 
     def read_cursor(self) -> CursorSnapshot:
         """Read and validate the v2 cursor without touching legacy `q:*` state."""
@@ -181,6 +377,24 @@ class TaskStore:
             CURSOR_KEY, self._expected(expected), cursor, event, advance=True,
         )
 
+    def ingest_failure(
+        self,
+        expected: CursorSnapshot,
+        next_cursor: Cursor,
+        occurrence: FailureOccurrence,
+        identity: IncidentIdentity,
+    ) -> IngestResult:
+        """Fence one QA failure and its cursor while preserving the established public contract."""
+        event = self._require_event(occurrence)
+        cursor = self._require_cursor(next_cursor)
+        if event["kind"] != "failure" or event["incident_id"] != identity["id"]:
+            raise TaskStoreError("incident_mismatch")
+        if any(identity[key] != event[key] for key in ("source_repo", "mode")):
+            raise TaskStoreError("incident_mismatch")
+        return self._ingest_registered_failure(
+            CURSOR_KEY, self._expected(expected), cursor, event, identity, advance=True,
+        )
+
     def _initialize_cursor(self, key: str, serialized: str) -> CursorInitializationResult:
         """Share SETNX initialization while keeping the QA and CI cursor keys separate."""
         reply = self._client.eval(_INITIALIZE_CURSOR, 1, key, serialized)
@@ -204,6 +418,53 @@ class TaskStore:
             expected, stable_json(next_cursor), stable_json(event), "1" if advance else "0",
         )
         return self._ingest_result(reply)
+
+    def _ingest_registered_failure(
+        self,
+        cursor_key: str,
+        expected: str,
+        next_cursor: Cursor,
+        event: dict[str, object],
+        identity: IncidentIdentity,
+        *,
+        advance: bool,
+    ) -> IngestResult:
+        """Reuse the single queue/registry ingress, optionally leaving a CI page pending."""
+        if event.get("incident_id") != identity["id"] or event.get("source_repo") != identity["source_repo"]:
+            raise TaskStoreError("incident_mismatch")
+        if event.get("mode", "unknown") != identity["mode"]:
+            raise TaskStoreError("incident_mismatch")
+        prototype: QueuedTask = queued_task(identity)
+        if self._require_task(prototype)["id"] != identity["id"]:
+            raise TaskStoreError("incident_invalid")
+        reply = self._client.eval(
+            _INGEST_FAILURE, 6, cursor_key, occurrence_key(str(event["occurrence_id"])),
+            task_key(identity["id"]), QUEUE_KEY, QUEUE_REGISTRY_KEY, observations_key(identity["id"]),
+            expected, stable_json(next_cursor), stable_json(event), stable_json(prototype),
+            event["occurrence_id"], identity["id"], identity["source_repo"], identity["category"],
+            identity["component"], identity["mode"], identity["error_family"],
+            "1" if advance else "0",
+        )
+        return self._ingest_result(reply)
+
+    def _read_task_snapshot(self, task_id: str) -> tuple[str, TaskState] | None:
+        """Read raw CAS bytes and validate their discriminated state together."""
+        key = task_key(task_id)
+        key_type = self._text(self._client.type(key))
+        if key_type == "none":
+            return None
+        if key_type != "string":
+            raise TaskStoreError("task_wrong_type")
+        raw = self._client.get(key)
+        if not isinstance(raw, str):
+            raise TaskStoreError("task_unreadable")
+        try:
+            result = validate_task(json.loads(raw))
+        except (TypeError, ValueError):
+            raise TaskStoreError("task_invalid_json") from None
+        if result["status"] != "valid":
+            raise TaskStoreError("task_invalid_state")
+        return raw, result["value"]
 
     @staticmethod
     def _text(value: object) -> str:
@@ -244,6 +505,13 @@ class TaskStore:
         return result["value"]
 
     @staticmethod
+    def _require_task(value: QueuedTask) -> TaskState:
+        result: TaskValidation = validate_task(value)
+        if result["status"] != "valid":
+            raise TaskStoreError("invalid_task")
+        return result["value"]
+
+    @staticmethod
     def _ingest_result(reply: list[object]) -> IngestResult:
         status = TaskStore._reply_status(reply)
         if status in ("stored", "duplicate", "stale_cursor"):
@@ -255,6 +523,17 @@ class TaskStore:
         if status == "timestamp_out_of_range":
             return {"status": "timestamp_out_of_range"}
         raise TaskStoreError("unexpected_ingest_result")
+
+    @staticmethod
+    def _decode_task(raw: object) -> TaskState:
+        try:
+            value = json.loads(TaskStore._text(raw))
+        except (TypeError, ValueError):
+            raise TaskStoreError("task_invalid_json") from None
+        result = validate_task(value)
+        if result["status"] != "valid":
+            raise TaskStoreError("task_invalid_state")
+        return result["value"]
 
     @staticmethod
     def _reply_status(reply: object) -> str:
