@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT / "ops" / "worker"))
 
 import redis
 from task_contracts import (
-    Cursor, FailureOccurrence, MAX_SAFE_TIMESTAMP_MS, classify_incident,
+    Cursor, FailureOccurrence, MAX_SAFE_COUNTER, MAX_SAFE_TIMESTAMP_MS, classify_incident,
     make_occurrence_id, stable_json, validate_qa_record, validate_task,
 )
 from task_store import (
@@ -26,6 +26,7 @@ from task_store import (
 )
 
 TS = "2026-10-01T12:00:00.000Z"
+COUNTER_LIMIT = MAX_SAFE_COUNTER
 SOURCE = "ManddarinShop/Hikoutei-Website"
 DISPOSABLE_ENV = "HIKOUTEI_OPS_TEST_DISPOSABLE"
 REDIS_RUN_ID_ENV = "HIKOUTEI_OPS_TEST_REDIS_RUN_ID"
@@ -498,6 +499,191 @@ class RedisBackedRecoveryTests(unittest.TestCase):
         assert task is not None
         self.assertEqual(task["created_at_ms"], MAX_SAFE_TIMESTAMP_MS)
         self.assertEqual(task["updated_at_ms"], MAX_SAFE_TIMESTAMP_MS)
+
+    def test_claim_rejects_unsafe_stored_timestamp_without_writes(self) -> None:
+        task_id = self._enqueue_counter_task()
+        raw = self._replace_task_counters(task_id, created_at_ms=1 << 53)
+        before = self._namespace_bytes()
+        with self.assertRaisesRegex(TaskStoreError, "task_invalid_state"):
+            self.store.claim(task_id, "worker")
+        self.assertEqual(self.redis.get(task_key(task_id)), raw)
+        self.assertEqual(self._namespace_bytes(), before)
+
+    def test_claim_rejects_invalid_owner_and_lease_duration(self) -> None:
+        task_id = self._enqueue_counter_task()
+        before = self._namespace_bytes()
+        for owner in ("é" * 65, "\ud800"):
+            with self.subTest(owner=type(owner).__name__), self.assertRaisesRegex(TaskStoreError, "invalid_owner"):
+                self.store.claim(task_id, owner)
+        for lease_seconds in (0, -1, True, 86401):
+            with self.subTest(lease_seconds=lease_seconds), self.assertRaisesRegex(TaskStoreError, "invalid_lease_duration"):
+                self.store.claim(task_id, "worker", lease_seconds=lease_seconds)
+        self.assertEqual(self._namespace_bytes(), before)
+
+    def test_claim_counter_exhaustion_preserves_task_cursor_and_queue(self) -> None:
+        for field in ("attempts", "epoch", "revision"):
+            with self.subTest(field=field):
+                self.redis.flushdb()
+                self.store = TaskStore(self.redis)
+                task_id = self._enqueue_counter_task()
+                raw = self._replace_task_counters(task_id, **{field: COUNTER_LIMIT})
+                before = self._counter_state(task_id)
+                self.assertEqual(self.store.claim(task_id, "worker")["status"], "counter_exhausted")
+                self.assertEqual(self._counter_state(task_id), before)
+                self.assertEqual(self.redis.get(task_key(task_id)), raw)
+
+    def test_claim_increments_all_max_minus_one_counters_exactly(self) -> None:
+        task_id = self._enqueue_counter_task()
+        self._replace_task_counters(
+            task_id,
+            attempts=COUNTER_LIMIT - 1,
+            epoch=COUNTER_LIMIT - 1,
+            revision=COUNTER_LIMIT - 1,
+        )
+        result = self.store.claim(task_id, "worker")
+        self.assertEqual(result["status"], "claimed")
+        assert result["status"] == "claimed"
+        self.assertEqual(
+            tuple(result["task"][field] for field in ("attempts", "epoch", "revision")),
+            (COUNTER_LIMIT, COUNTER_LIMIT, COUNTER_LIMIT),
+        )
+        stored = self.store.load_task(task_id)
+        assert stored is not None
+        self.assertEqual(
+            tuple(stored[field] for field in ("attempts", "epoch", "revision")),
+            (COUNTER_LIMIT, COUNTER_LIMIT, COUNTER_LIMIT),
+        )
+
+    def test_renew_rejects_invalid_owner_epoch_and_lease_duration(self) -> None:
+        task_id = self._enqueue_counter_task()
+        claimed = self.store.claim(task_id, "worker")
+        assert claimed["status"] == "claimed"
+        before = self._namespace_bytes()
+        for owner, epoch, lease_seconds, code in (
+            ("bad\ud800", claimed["task"]["epoch"], 300, "invalid_owner"),
+            ("worker", True, 300, "invalid_epoch"),
+            ("worker", claimed["task"]["epoch"], 0, "invalid_lease_duration"),
+        ):
+            with self.subTest(code=code), self.assertRaisesRegex(TaskStoreError, code):
+                self.store.renew(task_id, owner, epoch, lease_seconds=lease_seconds)
+        self.assertEqual(self._namespace_bytes(), before)
+
+    def test_renew_exhaustion_preserves_state_and_stale_owner_still_fails(self) -> None:
+        task_id = self._enqueue_counter_task()
+        claimed = self.store.claim(task_id, "worker")
+        assert claimed["status"] == "claimed"
+        self._replace_task_counters(task_id, revision=COUNTER_LIMIT)
+        before = self._counter_state(task_id)
+        self.assertEqual(self.store.renew(task_id, "stale", claimed["task"]["epoch"])["status"], "stale_owner")
+        self.assertEqual(self._counter_state(task_id), before)
+        self.assertEqual(self.store.renew(task_id, "worker", claimed["task"]["epoch"])["status"], "counter_exhausted")
+        self.assertEqual(self._counter_state(task_id), before)
+
+    def test_renew_increments_max_minus_one_revision_exactly(self) -> None:
+        task_id = self._enqueue_counter_task()
+        claimed = self.store.claim(task_id, "worker")
+        assert claimed["status"] == "claimed"
+        self._replace_task_counters(task_id, revision=COUNTER_LIMIT - 1)
+        result = self.store.renew(task_id, "worker", claimed["task"]["epoch"])
+        self.assertEqual(result["status"], "renewed")
+        assert result["status"] == "renewed"
+        self.assertEqual(result["task"]["revision"], COUNTER_LIMIT)
+        stored = self.store.load_task(task_id)
+        assert stored is not None
+        self.assertEqual(stored["revision"], COUNTER_LIMIT)
+
+    def test_owner_uses_utf8_byte_limit_for_input_and_stored_task_validation(self) -> None:
+        task_id = self._enqueue_counter_task()
+        queued = self.store.load_task(task_id)
+        assert queued is not None
+        for invalid_owner in ("é" * 65, "\ud800"):
+            with self.subTest(owner=type(invalid_owner).__name__), self.assertRaisesRegex(TaskStoreError, "invalid_owner"):
+                self.store.claim(task_id, invalid_owner)
+            self.assertEqual(self.store.load_task(task_id), queued)
+
+        owner = "é" * 64
+        claimed = self.store.claim(task_id, owner)
+        self.assertEqual(claimed["status"], "claimed")
+        assert claimed["status"] == "claimed"
+        self.assertEqual(claimed["task"]["owner"], owner)
+        renewed = self.store.renew(task_id, owner, claimed["task"]["epoch"])
+        self.assertEqual(renewed["status"], "renewed")
+        assert renewed["status"] == "renewed"
+        malformed = {**renewed["task"], "owner": "\ud800"}
+        self.redis.set(task_key(task_id), json.dumps(malformed, ensure_ascii=True))
+        with self.assertRaisesRegex(TaskStoreError, "task_invalid_state"):
+            self.store.load_task(task_id)
+
+    def test_lease_expiry_reclaim_fences_previous_owner_and_stale_renew(self) -> None:
+        task_id = self._enqueue_counter_task()
+        first = self.store.claim(task_id, "owner-a", lease_seconds=1)
+        self.assertEqual(first["status"], "claimed")
+        first_task = first["task"]
+        self.assertEqual(first_task["status"], "investigating")
+        self.assertEqual(self.store.claim(task_id, "owner-b", lease_seconds=1)["status"], "busy")
+        expired = {**first_task, "lease_until_ms": 0}
+        self.redis.set(task_key(task_id), stable_json(expired))
+        self.assertEqual(self.store.renew(task_id, "owner-a", first_task["epoch"], lease_seconds=1)["status"], "expired")
+        self.assertCountEqual(self.store.queued_ids(), [task_id])
+        second = self.store.claim(task_id, "owner-b", lease_seconds=1)
+        self.assertEqual(second["status"], "claimed")
+        self.assertEqual((second["task"]["attempts"], second["task"]["epoch"]), (2, 2))
+        self.assertEqual(self.store.renew(task_id, "owner-a", first_task["epoch"], lease_seconds=1)["status"], "stale_owner")
+        self.assertEqual(self.store.renew(task_id, "owner-b", second["task"]["epoch"], lease_seconds=1)["status"], "renewed")
+
+    def test_load_task_rejects_counter_at_2_to_53(self) -> None:
+        task_id = self._enqueue_counter_task()
+        raw = self._replace_task_counters(task_id, attempts=1 << 53)
+        self.assertEqual(self.redis.get(task_key(task_id)), raw)
+        with self.assertRaisesRegex(TaskStoreError, "task_invalid_state"):
+            self.store.load_task(task_id)
+
+    def test_claim_and_renew_at_max_safe_timestamp(self) -> None:
+        task_id = self._enqueue_counter_task()
+        now_ms = MAX_SAFE_TIMESTAMP_MS - 1_000
+        clock = FixedLuaTime(self.redis, now_ms // 1000, (now_ms % 1000) * 1000)
+        claimed = TaskStore(clock).claim(task_id, "worker", lease_seconds=1)
+        self.assertTrue(clock.injected)
+        self.assertEqual(claimed["status"], "claimed")
+        assert claimed["status"] == "claimed"
+        self.assertEqual(claimed["task"]["lease_until_ms"], MAX_SAFE_TIMESTAMP_MS)
+        self.assertEqual(claimed["task"]["updated_at_ms"], now_ms)
+
+        clock = FixedLuaTime(self.redis, now_ms // 1000, (now_ms % 1000) * 1000)
+        renewed = TaskStore(clock).renew(task_id, "worker", claimed["task"]["epoch"], lease_seconds=1)
+        self.assertTrue(clock.injected)
+        self.assertEqual(renewed["status"], "renewed")
+        assert renewed["status"] == "renewed"
+        self.assertEqual(renewed["task"]["lease_until_ms"], MAX_SAFE_TIMESTAMP_MS)
+        self.assertEqual(renewed["task"]["updated_at_ms"], now_ms)
+
+    def test_claim_and_renew_time_overflow_reject_before_writes(self) -> None:
+        task_id = self._enqueue_counter_task()
+        seconds_at_max = MAX_SAFE_TIMESTAMP_MS // 1000
+        seconds_over_max = seconds_at_max + 1
+        before = self._namespace_bytes()
+        clock = FixedLuaTime(self.redis, seconds=seconds_over_max)
+        self.assertEqual(TaskStore(clock).claim(task_id, "worker")["status"], "timestamp_out_of_range")
+        self.assertTrue(clock.injected)
+        self.assertEqual(self._namespace_bytes(), before)
+
+        claimed = self.store.claim(task_id, "worker")
+        assert claimed["status"] == "claimed"
+        before = self._namespace_bytes()
+        clock = FixedLuaTime(self.redis, seconds=seconds_over_max)
+        self.assertEqual(TaskStore(clock).renew(task_id, "worker", claimed["task"]["epoch"])["status"], "timestamp_out_of_range")
+        self.assertTrue(clock.injected)
+        self.assertEqual(self._namespace_bytes(), before)
+
+        investigating = {**claimed["task"], "lease_until_ms": MAX_SAFE_TIMESTAMP_MS}
+        raw_task = stable_json(investigating)
+        self.redis.set(task_key(task_id), raw_task)
+        before = self._namespace_bytes()
+        clock = FixedLuaTime(self.redis, seconds=seconds_at_max, microseconds=998_999)
+        self.assertEqual(TaskStore(clock).renew(task_id, "worker", claimed["task"]["epoch"])["status"], "timestamp_out_of_range")
+        self.assertTrue(clock.injected)
+        self.assertEqual(self.redis.get(task_key(task_id)), raw_task)
+        self.assertEqual(self._namespace_bytes(), before)
 
     def test_ingest_lua_rejects_task_counter_at_2_to_53_before_any_write(self) -> None:
         task_id = self._enqueue_counter_task()

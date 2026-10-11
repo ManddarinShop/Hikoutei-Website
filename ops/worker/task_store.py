@@ -7,7 +7,8 @@ import re
 from typing import Any, Literal, TypeAlias, TypedDict, cast
 from task_contracts import (
     Cursor, CursorValidation, EventValidation, FailureOccurrence, IncidentIdentity,
-    QueuedTask, StoredEvent, TaskState, TaskValidation, queued_task, stable_json,
+    MAX_SAFE_COUNTER, QueuedTask, StoredEvent, TaskState, TaskValidation,
+    is_safe_counter, is_safe_timestamp_ms, is_valid_owner, queued_task, stable_json,
     validate_cursor, validate_stored_event, validate_task,
 )
 
@@ -44,6 +45,36 @@ def execution_key(task_id: str) -> str:
     if not isinstance(task_id, str) or not re.fullmatch(r"inc_[0-9a-f]{64}", task_id):
         raise TaskStoreError("invalid_task_id")
     return PREFIX + "execution:" + task_id
+
+
+class Claimed(TypedDict):
+    status: Literal["claimed"]
+    task: TaskState
+
+
+class ClaimStatus(TypedDict):
+    status: Literal[
+        "busy", "stale_state", "not_found", "not_claimable", "wrong_type",
+        "invalid_state", "counter_exhausted", "timestamp_out_of_range",
+    ]
+
+
+ClaimResult: TypeAlias = Claimed | ClaimStatus
+
+
+class LeaseUpdated(TypedDict):
+    status: Literal["renewed"]
+    task: TaskState
+
+
+class LeaseStatus(TypedDict):
+    status: Literal[
+        "stale_state", "stale_owner", "expired", "not_investigating", "not_found",
+        "wrong_type", "invalid_state", "counter_exhausted", "timestamp_out_of_range",
+    ]
+
+
+LeaseResult: TypeAlias = LeaseUpdated | LeaseStatus
 
 
 class TaskStoreError(RuntimeError):
@@ -317,6 +348,134 @@ if event_exists then return {'duplicate'} end
 return {'stored'}
 """
 
+_CLAIM = r"""
+local MAX_SAFE_COUNTER = 2147483647
+local MAX_SAFE_TIMESTAMP_MS = 99999999999999
+local function safe_counter(value)
+  return type(value) == 'number' and value >= 0 and value <= MAX_SAFE_COUNTER
+      and value == math.floor(value)
+end
+local function safe_timestamp_ms(value)
+  return type(value) == 'number' and value >= 0 and value <= MAX_SAFE_TIMESTAMP_MS
+      and value == math.floor(value)
+end
+local function task_timestamps_valid(task)
+  if not safe_timestamp_ms(task.created_at_ms) or not safe_timestamp_ms(task.updated_at_ms)
+      or type(task.error) ~= 'table' then return false end
+  if task.error.status == 'recorded' then
+    if not safe_timestamp_ms(task.error.at_ms) then return false end
+  elseif task.error.status ~= 'none' then return false end
+  if task.status == 'investigating' then return safe_timestamp_ms(task.lease_until_ms) end
+  if task.status == 'blocked' then return safe_timestamp_ms(task.blocked_at_ms) end
+  return task.status == 'queued'
+end
+local function current_time_ms()
+  local time = redis.call('TIME')
+  local seconds = tonumber(time[1])
+  local microseconds = tonumber(time[2])
+  if type(seconds) ~= 'number' or seconds < 0 or seconds ~= math.floor(seconds)
+      or type(microseconds) ~= 'number' or microseconds < 0
+      or microseconds >= 1000000 or microseconds ~= math.floor(microseconds) then return nil end
+  local now_ms = seconds * 1000 + math.floor(microseconds / 1000)
+  if not safe_timestamp_ms(now_ms) then return nil end
+  return now_ms
+end
+local task_type = redis.call('TYPE', KEYS[1]).ok
+if task_type ~= 'none' and task_type ~= 'string' then return {'wrong_type'} end
+if task_type == 'none' then return {'not_found'} end
+local raw = redis.call('GET', KEYS[1])
+if raw ~= ARGV[3] then return {'stale_state'} end
+local ok, task = pcall(cjson.decode, raw)
+if not ok or type(task) ~= 'table' or task.schema_version ~= 2
+    or type(task.status) ~= 'string' or not safe_counter(task.attempts)
+    or not safe_counter(task.epoch) or not safe_counter(task.revision)
+    or not task_timestamps_valid(task) then
+  return {'invalid_state'}
+end
+local now_ms = current_time_ms()
+if now_ms == nil then return {'timestamp_out_of_range'} end
+if task.status == 'investigating' then
+  if type(task.lease_until_ms) ~= 'number' then return {'invalid_state'} end
+  if task.lease_until_ms > now_ms then return {'busy'} end
+elseif task.status ~= 'queued' then
+  return {'not_claimable'}
+end
+if task.attempts == MAX_SAFE_COUNTER or task.epoch == MAX_SAFE_COUNTER
+    or task.revision == MAX_SAFE_COUNTER then return {'counter_exhausted'} end
+local lease_until_ms = now_ms + tonumber(ARGV[2])
+if not safe_timestamp_ms(lease_until_ms) then return {'timestamp_out_of_range'} end
+task.status = 'investigating'
+task.owner = ARGV[1]
+task.lease_until_ms = lease_until_ms
+task.attempts = task.attempts + 1
+task.epoch = task.epoch + 1
+task.revision = task.revision + 1
+task.updated_at_ms = now_ms
+local encoded = cjson.encode(task)
+redis.call('SET', KEYS[1], encoded)
+return {'claimed', encoded}
+"""
+
+_RENEW = r"""
+local MAX_SAFE_COUNTER = 2147483647
+local MAX_SAFE_TIMESTAMP_MS = 99999999999999
+local function safe_counter(value)
+  return type(value) == 'number' and value >= 0 and value <= MAX_SAFE_COUNTER
+      and value == math.floor(value)
+end
+local function safe_timestamp_ms(value)
+  return type(value) == 'number' and value >= 0 and value <= MAX_SAFE_TIMESTAMP_MS
+      and value == math.floor(value)
+end
+local function task_timestamps_valid(task)
+  if not safe_timestamp_ms(task.created_at_ms) or not safe_timestamp_ms(task.updated_at_ms)
+      or type(task.error) ~= 'table' then return false end
+  if task.error.status == 'recorded' then
+    if not safe_timestamp_ms(task.error.at_ms) then return false end
+  elseif task.error.status ~= 'none' then return false end
+  if task.status == 'investigating' then return safe_timestamp_ms(task.lease_until_ms) end
+  if task.status == 'blocked' then return safe_timestamp_ms(task.blocked_at_ms) end
+  return task.status == 'queued'
+end
+local function current_time_ms()
+  local time = redis.call('TIME')
+  local seconds = tonumber(time[1])
+  local microseconds = tonumber(time[2])
+  if type(seconds) ~= 'number' or seconds < 0 or seconds ~= math.floor(seconds)
+      or type(microseconds) ~= 'number' or microseconds < 0
+      or microseconds >= 1000000 or microseconds ~= math.floor(microseconds) then return nil end
+  local now_ms = seconds * 1000 + math.floor(microseconds / 1000)
+  if not safe_timestamp_ms(now_ms) then return nil end
+  return now_ms
+end
+local t = redis.call('TYPE', KEYS[1]).ok
+if t ~= 'none' and t ~= 'string' then return {'wrong_type'} end
+if t == 'none' then return {'not_found'} end
+local raw = redis.call('GET', KEYS[1])
+if raw ~= ARGV[4] then return {'stale_state'} end
+local ok, task = pcall(cjson.decode, raw)
+if not ok or type(task) ~= 'table' or task.schema_version ~= 2
+    or type(task.status) ~= 'string' or type(task.epoch) ~= 'number'
+    or not safe_counter(task.revision) or not task_timestamps_valid(task) then
+  return {'invalid_state'}
+end
+if task.status ~= 'investigating' then return {'not_investigating'} end
+if task.owner ~= ARGV[1] or task.epoch ~= tonumber(ARGV[2]) then return {'stale_owner'} end
+local now_ms = current_time_ms()
+if now_ms == nil then return {'timestamp_out_of_range'} end
+if type(task.lease_until_ms) ~= 'number' then return {'invalid_state'} end
+if task.lease_until_ms <= now_ms then return {'expired'} end
+if task.revision == MAX_SAFE_COUNTER then return {'counter_exhausted'} end
+local lease_until_ms = now_ms + tonumber(ARGV[3])
+if not safe_timestamp_ms(lease_until_ms) then return {'timestamp_out_of_range'} end
+task.lease_until_ms = lease_until_ms
+task.revision = task.revision + 1
+task.updated_at_ms = now_ms
+local encoded = cjson.encode(task)
+redis.call('SET', KEYS[1], encoded)
+return {'renewed', encoded}
+"""
+
 _READ_QUEUE_SNAPSHOT = r"""
 local registry_type = redis.call('TYPE', KEYS[1]).ok
 local queue_type = redis.call('TYPE', KEYS[2]).ok
@@ -338,6 +497,49 @@ class TaskStore:
 
     def __init__(self, client: Any):
         self._client = client
+
+    def claim(
+        self,
+        task_id: str,
+        owner: str,
+        lease_seconds: int = DEFAULT_LEASE_SECONDS,
+    ) -> ClaimResult:
+        """Claim queued work or fence-reclaim an expired lease using Redis server time."""
+        self._validate_owner_lease(owner, lease_seconds)
+        snapshot = self._read_task_snapshot(task_id)
+        if snapshot is None:
+            return {"status": "not_found"}
+        expected_raw, _ = snapshot
+        reply = self._client.eval(
+            _CLAIM, 1, task_key(task_id), owner, lease_seconds * 1000, expected_raw,
+        )
+        status = self._reply_status(reply)
+        if status != "claimed":
+            return {"status": cast(Any, status)}
+        return {"status": "claimed", "task": self._decode_task(reply[1])}
+
+    def renew(
+        self,
+        task_id: str,
+        owner: str,
+        epoch: int,
+        lease_seconds: int = DEFAULT_LEASE_SECONDS,
+    ) -> LeaseResult:
+        """Extend only the current, unexpired owner/epoch lease."""
+        self._validate_owner_lease(owner, lease_seconds)
+        if not self._nonnegative_int(epoch):
+            raise TaskStoreError("invalid_epoch")
+        snapshot = self._read_task_snapshot(task_id)
+        if snapshot is None:
+            return {"status": "not_found"}
+        expected_raw, _ = snapshot
+        reply = self._client.eval(
+            _RENEW, 1, task_key(task_id), owner, epoch, lease_seconds * 1000, expected_raw,
+        )
+        status = self._reply_status(reply)
+        if status != "renewed":
+            return {"status": cast(Any, status)}
+        return {"status": "renewed", "task": self._decode_task(reply[1])}
 
     def load_task(self, task_id: str) -> TaskState | None:
         """Load one durable task only after strict lifecycle validation."""
@@ -648,6 +850,17 @@ class TaskStore:
         if result["status"] != "valid":
             raise TaskStoreError("task_invalid_state")
         return result["value"]
+
+    @staticmethod
+    def _nonnegative_int(value: object) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+    @staticmethod
+    def _validate_owner_lease(owner: str, lease_seconds: int) -> None:
+        if not is_valid_owner(owner):
+            raise TaskStoreError("invalid_owner")
+        if not TaskStore._nonnegative_int(lease_seconds) or not 0 < lease_seconds <= MAX_LEASE_SECONDS:
+            raise TaskStoreError("invalid_lease_duration")
 
     @staticmethod
     def _reply_status(reply: object) -> str:
