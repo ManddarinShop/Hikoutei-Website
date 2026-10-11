@@ -1,4 +1,4 @@
-"""Validated v2 QA-record and cursor contracts."""
+"""Validated v2 task, QA-record, cursor, and lifecycle contracts."""
 from __future__ import annotations
 
 import hashlib
@@ -189,6 +189,67 @@ class InvalidRecord(TypedDict):
 RecordValidation: TypeAlias = ValidRecord | InvalidRecord
 
 
+class ErrorNone(TypedDict):
+    status: Literal["none"]
+
+
+class ErrorRecorded(TypedDict):
+    status: Literal["recorded"]
+    code: str
+    at_ms: int
+
+
+TaskError: TypeAlias = ErrorNone | ErrorRecorded
+
+
+class TaskBase(TypedDict):
+    schema_version: Literal[2]
+    id: str
+    source_repo: str
+    category: str
+    component: str
+    mode: Literal["local", "sync", "unknown"]
+    error_family: str
+    attempts: int
+    epoch: int
+    revision: int
+    created_at_ms: int
+    updated_at_ms: int
+    error: TaskError
+
+
+class QueuedTask(TaskBase):
+    status: Literal["queued"]
+
+
+class InvestigatingTask(TaskBase):
+    status: Literal["investigating"]
+    owner: str
+    lease_until_ms: int
+
+
+class BlockedTask(TaskBase):
+    status: Literal["blocked"]
+    reason_code: str
+    blocked_at_ms: int
+
+
+TaskState: TypeAlias = QueuedTask | InvestigatingTask | BlockedTask
+
+
+class ValidTask(TypedDict):
+    status: Literal["valid"]
+    value: TaskState
+
+
+class InvalidTask(TypedDict):
+    status: Literal["invalid"]
+    code: str
+
+
+TaskValidation: TypeAlias = ValidTask | InvalidTask
+
+
 class IncidentIdentity(TypedDict):
     id: str
     source_repo: str
@@ -207,8 +268,28 @@ def is_int(value: object, *, minimum: int = 0) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= minimum
 
 
+def is_safe_counter(value: object) -> bool:
+    """Validate an incrementable task counter within exact Redis Lua JSON range."""
+    return is_int(value) and value <= MAX_SAFE_COUNTER
+
+
+def is_safe_timestamp_ms(value: object) -> bool:
+    """Validate a nonnegative millisecond timestamp within Lua cjson's exact range."""
+    return is_int(value) and value <= MAX_SAFE_TIMESTAMP_MS
+
+
 def is_qa_seed(value: object) -> bool:
     return is_int(value) and value <= MAX_QA_SEED
+
+
+def is_valid_owner(value: object) -> bool:
+    """Match Lua's 128-byte owner bound and reject invalid UTF-8 strings."""
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        return len(value.encode("utf-8")) <= MAX_OWNER_BYTES
+    except UnicodeEncodeError:
+        return False
 
 
 def is_timestamp(value: object) -> bool:
@@ -382,3 +463,175 @@ def validate_cursor(value: object) -> CursorValidation:
     else:
         return {"status": "invalid", "code": "cursor_boot_context"}
     return {"status": "valid", "value": cast(Cursor, value)}
+
+
+def validate_stored_event(value: object) -> EventValidation:
+    """Validate normalized evidence and bind its IDs to the file record and incident."""
+    if not isinstance(value, dict):
+        return {"status": "invalid", "code": "event_not_object"}
+    kind = value.get("kind")
+    base = {"schema_version", "occurrence_id", "source_repo", "generation", "offset", "file", "raw_sha256", "kind"}
+    if value.get("schema_version") != 2:
+        return {"status": "invalid", "code": "event_version"}
+    if not isinstance(value.get("occurrence_id"), str) or not re.fullmatch(r"occ_[0-9a-f]{64}", value["occurrence_id"]):
+        return {"status": "invalid", "code": "event_id"}
+    if value.get("source_repo") not in SOURCE_REPOSITORIES:
+        return {"status": "invalid", "code": "event_source"}
+    if not is_int(value.get("generation")) or not is_int(value.get("offset")):
+        return {"status": "invalid", "code": "event_location"}
+    raw_sha256 = value.get("raw_sha256")
+    if not isinstance(raw_sha256, str) or not _SHA256.fullmatch(raw_sha256):
+        return {"status": "invalid", "code": "event_digest"}
+    file_value = value.get("file")
+    if (
+        not isinstance(file_value, dict)
+        or set(file_value) != {"status", "device", "inode"}
+        or file_value.get("status") != "bound"
+        or not is_int(file_value.get("device"))
+        or not is_int(file_value.get("inode"))
+    ):
+        return {"status": "invalid", "code": "event_file"}
+    if kind == "quarantined":
+        if set(value) != base | {"status", "reason_code"} or value.get("status") != "blocked":
+            return {"status": "invalid", "code": "quarantine_shape"}
+        if value.get("reason_code") not in ("invalid_json", "invalid_utf8", "invalid_record", "oversized_line"):
+            return {"status": "invalid", "code": "quarantine_reason"}
+        expected_occurrence_id = make_occurrence_id(
+            value["source_repo"], file_value["device"], file_value["inode"],
+            value["generation"], value["offset"], raw_sha256,
+        )
+        if value["occurrence_id"] != expected_occurrence_id:
+            return {"status": "invalid", "code": "quarantine_digest"}
+        return {"status": "valid", "value": cast(QuarantineOccurrence, value)}
+    if kind not in ("boot", "summary", "failure"):
+        return {"status": "invalid", "code": "event_kind"}
+    expected = base | {"record"}
+    if kind == "failure":
+        expected |= {"mode", "incident_id"}
+    if set(value) != expected or not isinstance(value.get("record"), dict):
+        return {"status": "invalid", "code": "record_event_shape"}
+    record = value["record"]
+    record_type = record.get("type")
+    if record_type != kind:
+        return {"status": "invalid", "code": "record_event_type"}
+    expected_occurrence_id = make_occurrence_id(
+        value["source_repo"], file_value["device"], file_value["inode"],
+        value["generation"], value["offset"], raw_sha256,
+    )
+    if value["occurrence_id"] != expected_occurrence_id:
+        return {"status": "invalid", "code": "event_occurrence_identity"}
+    if kind == "boot":
+        if set(record) != {"type", "ts", "seed", "sync_mode"}:
+            return {"status": "invalid", "code": "stored_boot_shape"}
+        if not is_timestamp(record.get("ts")) or not is_qa_seed(record.get("seed")):
+            return {"status": "invalid", "code": "stored_boot_fields"}
+        if record.get("sync_mode") not in ERROR_MODES:
+            return {"status": "invalid", "code": "stored_boot_mode"}
+    elif kind == "summary":
+        raw = dict(record)
+        # Reuse the strict summary boundary; its stored and input shapes match.
+        result = validate_qa_record(raw)
+        if result["status"] != "valid" or result["value"]["type"] != "summary":
+            return {"status": "invalid", "code": "stored_summary_shape"}
+    else:
+        raw = dict(record)
+        result = validate_qa_record(raw)
+        if result["status"] != "valid" or result["value"]["type"] != "failure":
+            return {"status": "invalid", "code": "stored_failure_shape"}
+        if value.get("mode") not in ERROR_MODES:
+            return {"status": "invalid", "code": "event_mode"}
+        if not isinstance(value.get("incident_id"), str) or not re.fullmatch(r"inc_[0-9a-f]{64}", value["incident_id"]):
+            return {"status": "invalid", "code": "event_incident"}
+        expected_incident = classify_incident(value["source_repo"], result["value"], value["mode"])
+        if value["incident_id"] != expected_incident["id"]:
+            return {"status": "invalid", "code": "event_incident"}
+    return {"status": "valid", "value": cast(RecordOccurrence, value)}
+
+
+def _is_task_error(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if value == {"status": "none"}:
+        return True
+    return (
+        set(value) == {"status", "code", "at_ms"}
+        and value.get("status") == "recorded"
+        and isinstance(value.get("code"), str)
+        and _SAFE_CODE.fullmatch(value["code"]) is not None
+        and is_safe_timestamp_ms(value.get("at_ms"))
+    )
+
+
+def validate_task(value: object) -> TaskValidation:
+    """Promote an untrusted Redis task document into one lifecycle state."""
+    if not isinstance(value, dict):
+        return {"status": "invalid", "code": "task_not_object"}
+    common = {
+        "schema_version", "id", "source_repo", "category", "component", "mode",
+        "error_family", "attempts", "epoch", "revision", "created_at_ms",
+        "updated_at_ms", "error", "status",
+    }
+    state = value.get("status")
+    extra_by_state = {
+        "queued": set(),
+        "investigating": {"owner", "lease_until_ms"},
+        "blocked": {"reason_code", "blocked_at_ms"},
+    }
+    if not isinstance(state, str) or state not in extra_by_state or set(value) != common | extra_by_state[state]:
+        return {"status": "invalid", "code": "task_shape"}
+    if value.get("schema_version") != 2:
+        return {"status": "invalid", "code": "task_version"}
+    if not isinstance(value.get("id"), str) or not re.fullmatch(r"inc_[0-9a-f]{64}", value["id"]):
+        return {"status": "invalid", "code": "task_id"}
+    if value.get("source_repo") not in SOURCE_REPOSITORIES:
+        return {"status": "invalid", "code": "task_source"}
+    for field in ("category", "component", "error_family"):
+        if not isinstance(value.get(field), str) or not value[field] or len(value[field]) > 128:
+            return {"status": "invalid", "code": f"task_{field}"}
+    if value.get("mode") not in ERROR_MODES:
+        return {"status": "invalid", "code": "task_mode"}
+    for field in ("attempts", "epoch", "revision"):
+        if not is_safe_counter(value.get(field)):
+            return {"status": "invalid", "code": f"task_{field}"}
+    for field in ("created_at_ms", "updated_at_ms"):
+        if not is_safe_timestamp_ms(value.get(field)):
+            return {"status": "invalid", "code": f"task_{field}"}
+    if not _is_task_error(value.get("error")):
+        return {"status": "invalid", "code": "task_error"}
+    identity = {field: value[field] for field in ("source_repo", "category", "component", "mode", "error_family")}
+    expected_id = "inc_" + hashlib.sha256(stable_json(identity).encode("utf-8")).hexdigest()
+    if value["id"] != expected_id:
+        return {"status": "invalid", "code": "task_identity"}
+    if state == "investigating":
+        if not is_valid_owner(value.get("owner")):
+            return {"status": "invalid", "code": "task_owner"}
+        if not is_safe_timestamp_ms(value.get("lease_until_ms")):
+            return {"status": "invalid", "code": "task_lease"}
+    elif state == "blocked":
+        if not isinstance(value.get("reason_code"), str) or not _SAFE_CODE.fullmatch(value["reason_code"]):
+            return {"status": "invalid", "code": "task_reason"}
+        if not is_safe_timestamp_ms(value.get("blocked_at_ms")):
+            return {"status": "invalid", "code": "task_blocked_time"}
+    return {"status": "valid", "value": cast(TaskState, value)}
+
+
+def queued_task(identity: IncidentIdentity) -> QueuedTask:
+    """Create the initial task shape; Redis adds server-time fields atomically."""
+    return {
+        "schema_version": 2,
+        **identity,
+        "status": "queued",
+        "attempts": 0,
+        "epoch": 0,
+        "revision": 0,
+        "created_at_ms": 0,
+        "updated_at_ms": 0,
+        "error": {"status": "none"},
+    }
+
+
+def safe_code(value: str) -> str:
+    """Validate a short stable reason/error code without accepting raw messages."""
+    if not isinstance(value, str) or not _SAFE_CODE.fullmatch(value):
+        raise ContractError("invalid_reason_code")
+    return value
