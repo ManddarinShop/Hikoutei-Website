@@ -17,8 +17,8 @@ sys.path.insert(0, str(ROOT / "ops" / "worker"))
 
 import redis
 from task_contracts import (
-    Cursor, FailureOccurrence, classify_incident, make_occurrence_id, stable_json,
-    validate_qa_record,
+    Cursor, FailureOccurrence, MAX_SAFE_TIMESTAMP_MS, classify_incident,
+    make_occurrence_id, stable_json, validate_qa_record, validate_task,
 )
 from task_store import (
     CURSOR_KEY, QUEUE_KEY, QUEUE_REGISTRY_KEY, TaskStore, TaskStoreError,
@@ -104,6 +104,30 @@ def make_failure_event(raw: bytes, *, mode: str = "unknown") -> tuple[FailureOcc
     return event, identity, cursor
 
 
+class FixedLuaTime:
+    marker = "local time = redis.call('TIME')"
+
+    def __init__(self, client, seconds: int, microseconds: int = 0):
+        self.client = client
+        self.seconds = seconds
+        self.microseconds = microseconds
+        self.injected = False
+
+    def __getattr__(self, name):
+        return getattr(self.client, name)
+
+    def eval(self, script, numkeys, *parts):
+        if self.marker not in script:
+            raise AssertionError("test script did not expose the Redis TIME seam")
+        script = script.replace(
+            self.marker,
+            f"local time = {{{self.seconds}, {self.microseconds}}}",
+            1,
+        )
+        self.injected = True
+        return self.client.eval(script, numkeys, *parts)
+
+
 class RedisBackedRecoveryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -138,6 +162,58 @@ class RedisBackedRecoveryTests(unittest.TestCase):
         # Reuse the server-identity-validated runner connection for every destructive reset.
         self.redis.flushdb()
         self.store = TaskStore(self.redis)
+
+    def _enqueue_counter_task(self) -> str:
+        raw = qa_line(failure("count drift at step 1: runtime=2 model=1", seed=95))
+        event, identity, cursor = make_failure_event(raw)
+        self.assertEqual(
+            self.store.ingest_failure(self.store.read_cursor(), cursor, event, identity),
+            {"status": "stored"},
+        )
+        return identity["id"]
+
+    def _enqueue_two_counter_tasks(self) -> list[str]:
+        first_raw = qa_line(failure("count drift at step 1: runtime=96 model=95", seed=95))
+        first_event, first_identity, first_cursor = make_failure_event(first_raw)
+        self.assertEqual(
+            self.store.ingest_failure(self.store.read_cursor(), first_cursor, first_event, first_identity),
+            {"status": "stored"},
+        )
+
+        second_raw = qa_line(failure("UNKNOWN expected revision 6, observed 5", seed=96))
+        second_event, second_identity, second_cursor = make_failure_event(second_raw)
+        offset = len(first_raw)
+        digest = hashlib.sha256(second_raw).hexdigest()
+        second_event["offset"] = offset
+        second_event["occurrence_id"] = make_occurrence_id(SOURCE, 1, 2, 0, offset, digest)
+        second_cursor["offset"] = offset + len(second_raw)
+        second_cursor["boundary_sha256"] = hashlib.sha256((first_raw + second_raw)[-128:]).hexdigest()
+        self.assertNotEqual(first_identity["id"], second_identity["id"], "fixtures must exercise two task registrations")
+        self.assertEqual(
+            self.store.ingest_failure(self.store.read_cursor(), second_cursor, second_event, second_identity),
+            {"status": "stored"},
+        )
+        task_ids = [first_identity["id"], second_identity["id"]]
+        self.assertEqual(self.redis.xlen(QUEUE_KEY), 2)
+        self.assertCountEqual(self.store.queued_ids(), task_ids)
+        return task_ids
+
+    def _replace_task_counters(self, task_id: str, **counters: int) -> str:
+        task = self.store.load_task(task_id)
+        assert task is not None
+        raw = stable_json({**task, **counters})
+        self.redis.set(task_key(task_id), raw)
+        return raw
+
+    def _counter_state(self, task_id: str) -> tuple[object, ...]:
+        return (
+            self.redis.get(task_key(task_id)),
+            self.redis.get(CURSOR_KEY),
+            self.redis.xrange(QUEUE_KEY),
+            self.redis.hgetall(QUEUE_REGISTRY_KEY),
+            self.store.observation_ids(task_id),
+            tuple(sorted((key, self.redis.get(key)) for key in self.redis.scan_iter("ops:v2:occurrence:*"))),
+        )
 
     def _namespace_bytes(self) -> dict[str, bytes | None]:
         return {key: self.redis.dump(key) for key in self.redis.scan_iter("ops:v2:*")}
@@ -211,6 +287,229 @@ class RedisBackedRecoveryTests(unittest.TestCase):
         self.redis.delete(CURSOR_KEY)
         self.redis.lpush(CURSOR_KEY, "wrong-type")
         self.assertEqual(self.store.initialize_cursor(first), {"status": "wrong_type"})
+
+    def test_missing_queue_with_registration_fails_without_mutating_other_keys(self) -> None:
+        task_id = self._enqueue_counter_task()
+        before = {
+            key: self.redis.dump(key)
+            for key in self.redis.scan_iter("ops:v2:*")
+            if key != QUEUE_KEY
+        }
+        self.redis.delete(QUEUE_KEY)
+
+        with self.assertRaisesRegex(TaskStoreError, "queue_registry_without_queue"):
+            self.store.queued_ids()
+
+        after = {key: self.redis.dump(key) for key in self.redis.scan_iter("ops:v2:*")}
+        self.assertEqual(after, before)
+        self.assertIsNotNone(self.store.load_task(task_id))
+
+    def test_ingress_error_before_queue_registration_retries_without_advancing(self) -> None:
+        raw = qa_line(failure("registration marker recovery", seed=99))
+        event, identity, cursor = make_failure_event(raw)
+        marker = "redis.call('HSET', KEYS[5], ARGV[6], '__pending__')"
+
+        class InjectPendingFailure:
+            def __init__(self, client):
+                self.client = client
+                self.injected = False
+
+            def __getattr__(self, name):
+                return getattr(self.client, name)
+
+            def eval(self, script, numkeys, *parts):
+                if not self.injected and marker in script:
+                    script = script.replace(marker, "redis.call('NO_SUCH_TEST_COMMAND')", 1)
+                    self.injected = True
+                return self.client.eval(script, numkeys, *parts)
+
+        broken = InjectPendingFailure(self.redis)
+        with self.assertRaises(redis.exceptions.ResponseError):
+            TaskStore(broken).ingest_failure({"status": "missing"}, cursor, event, identity)
+        self.assertTrue(broken.injected)
+        before = self._namespace_bytes()
+        self.assertEqual(self.store.queued_ids(), [])
+        self.assertEqual(self._namespace_bytes(), before)
+        self.assertEqual(self.store.read_cursor(), {"status": "missing"})
+
+        self.assertEqual(
+            self.store.ingest_failure({"status": "missing"}, cursor, event, identity),
+            {"status": "duplicate"},
+        )
+        self.assertEqual(self.store.queued_ids(), [identity["id"]])
+
+    def test_pending_stream_registration_is_discoverable_and_repaired_on_retry(self) -> None:
+        raw = qa_line(failure("pending registration recovery", seed=98))
+        event, identity, cursor = make_failure_event(raw)
+        target = "if registration ~= stream_id then redis.call('HSET', KEYS[5], ARGV[6], stream_id) end"
+
+        class InjectFinalizeFailure:
+            def __init__(self, client):
+                self.client = client
+                self.injected = False
+
+            def __getattr__(self, name):
+                return getattr(self.client, name)
+
+            def eval(self, script, numkeys, *parts):
+                if not self.injected and target in script:
+                    script = script.replace(target, "redis.call('NO_SUCH_TEST_COMMAND')", 1)
+                    self.injected = True
+                return self.client.eval(script, numkeys, *parts)
+
+        broken = InjectFinalizeFailure(self.redis)
+        with self.assertRaises(redis.exceptions.ResponseError):
+            TaskStore(broken).ingest_failure({"status": "missing"}, cursor, event, identity)
+        self.assertTrue(broken.injected)
+        self.assertEqual(self.store.queued_ids(), [identity["id"]])
+        self.assertIsNone(self.store.load_task(identity["id"]))
+
+        self.assertEqual(
+            self.store.ingest_failure({"status": "missing"}, cursor, event, identity),
+            {"status": "duplicate"},
+        )
+        self.assertEqual(self.store.queued_ids(), [identity["id"]])
+        self.assertIsNotNone(self.store.load_task(identity["id"]))
+
+    def test_queued_ids_only_returns_queued_or_expired_tasks(self) -> None:
+        task_id = self._enqueue_counter_task()
+        task = self.store.load_task(task_id)
+        assert task is not None
+        self.redis.set(task_key(task_id), stable_json({**task, "status": "investigating", "owner": "worker", "lease_until_ms": MAX_SAFE_TIMESTAMP_MS}))
+        self.assertEqual(self.store.queued_ids(), [])
+        self.redis.set(task_key(task_id), stable_json({**task, "status": "investigating", "owner": "worker", "lease_until_ms": 0}))
+        self.assertEqual(self.store.queued_ids(), [task_id])
+
+    def test_empty_namespace_has_no_queued_ids(self) -> None:
+        self.assertEqual(self.store.queued_ids(), [])
+
+    def test_queued_ids_rejects_empty_retained_stream(self) -> None:
+        task_id = self._enqueue_counter_task()
+        stream_id, _ = self.redis.xrange(QUEUE_KEY)[0]
+        self.assertEqual(self.redis.xdel(QUEUE_KEY, stream_id), 1)
+        self.assertEqual(self.redis.type(QUEUE_KEY), "stream")
+        before = self._namespace_bytes()
+
+        with self.assertRaisesRegex(TaskStoreError, "queue_invalid_registration"):
+            self.store.queued_ids()
+
+        self.assertEqual(self._namespace_bytes(), before)
+        self.assertIsNotNone(self.redis.get(task_key(task_id)))
+
+    def test_queued_ids_rejects_missing_finalized_entry_in_nonempty_stream(self) -> None:
+        self._enqueue_two_counter_tasks()
+        stream_ids = [stream_id for stream_id, _ in self.redis.xrange(QUEUE_KEY)]
+        self.assertEqual(self.redis.xdel(QUEUE_KEY, stream_ids[0]), 1)
+        before = self._namespace_bytes()
+
+        with self.assertRaisesRegex(TaskStoreError, "queue_invalid_registration"):
+            self.store.queued_ids()
+
+        self.assertEqual(self._namespace_bytes(), before)
+
+    def test_queued_ids_rejects_mismatched_finalized_reference(self) -> None:
+        task_ids = self._enqueue_two_counter_tasks()
+        stream_ids = {
+            fields["task_id"]: stream_id
+            for stream_id, fields in self.redis.xrange(QUEUE_KEY)
+        }
+        self.assertEqual(self.redis.xdel(QUEUE_KEY, stream_ids[task_ids[0]]), 1)
+        self.redis.hset(QUEUE_REGISTRY_KEY, task_ids[0], "0-1")
+        before = self._namespace_bytes()
+
+        with self.assertRaisesRegex(TaskStoreError, "queue_invalid_registration"):
+            self.store.queued_ids()
+
+        self.assertEqual(self._namespace_bytes(), before)
+
+    def test_queued_ids_rejects_duplicate_finalized_reference(self) -> None:
+        task_ids = self._enqueue_two_counter_tasks()
+        stream_ids = {
+            fields["task_id"]: stream_id
+            for stream_id, fields in self.redis.xrange(QUEUE_KEY)
+        }
+        self.assertEqual(self.redis.xdel(QUEUE_KEY, stream_ids[task_ids[1]]), 1)
+        self.redis.hset(QUEUE_REGISTRY_KEY, task_ids[1], stream_ids[task_ids[0]])
+        before = self._namespace_bytes()
+
+        with self.assertRaisesRegex(TaskStoreError, "queue_invalid_registration"):
+            self.store.queued_ids()
+
+        self.assertEqual(self._namespace_bytes(), before)
+
+    def test_missing_queue_rejects_wrong_type_and_pending_registry(self) -> None:
+        self.redis.rpush(QUEUE_REGISTRY_KEY, "not-a-hash")
+        with self.assertRaisesRegex(TaskStoreError, "queue_registry_wrong_type"):
+            self.store.queued_ids()
+        self.assertEqual(self.redis.lrange(QUEUE_REGISTRY_KEY, 0, -1), ["not-a-hash"])
+
+        self.redis.delete(QUEUE_REGISTRY_KEY)
+        self.redis.hset(QUEUE_REGISTRY_KEY, "inc_" + "0" * 64, "__pending__")
+        pending = self.redis.dump(QUEUE_REGISTRY_KEY)
+        with self.assertRaisesRegex(TaskStoreError, "queue_registry_without_queue"):
+            self.store.queued_ids()
+        self.assertEqual(self.redis.dump(QUEUE_REGISTRY_KEY), pending)
+        self.assertEqual(self.redis.type(QUEUE_KEY), "none")
+
+    def test_ingest_lua_rejects_every_unsafe_task_timestamp_without_writes(self) -> None:
+        for index, field in enumerate(("created_at_ms", "updated_at_ms", "error_at_ms", "lease_until_ms", "blocked_at_ms"), start=2):
+            with self.subTest(field=field):
+                self.redis.flushdb()
+                self.store = TaskStore(self.redis)
+                task_id = self._enqueue_counter_task()
+                task = self.store.load_task(task_id)
+                assert task is not None
+                if field == "lease_until_ms":
+                    task = {**task, "status": "investigating", "owner": "worker", "lease_until_ms": 1000}
+                elif field == "blocked_at_ms":
+                    task = {**task, "status": "blocked", "reason_code": "prior_error", "blocked_at_ms": 1000}
+                self.assertEqual(validate_task(task)["status"], "valid")
+                self.redis.set(task_key(task_id), stable_json(task))
+                if field == "error_at_ms":
+                    invalid_task = {**task, "error": {"status": "recorded", "code": "prior_error", "at_ms": 1 << 53}}
+                else:
+                    invalid_task = {**task, field: 1 << 53}
+                raw_task = stable_json(invalid_task)
+                self.redis.set(task_key(task_id), raw_task)
+                before = self._namespace_bytes()
+                raw_event = qa_line(failure(f"count drift at step {index}: runtime={index + 10} model={index + 9}", seed=95, step=index))
+                event, identity, cursor = make_failure_event(raw_event)
+                result = self.store.ingest_failure(self.store.read_cursor(), cursor, event, identity)
+                self.assertEqual(result, {"status": "invalid_state"})
+                self.assertEqual(self.redis.get(task_key(task_id)), raw_task)
+                self.assertEqual(self._namespace_bytes(), before)
+                with self.assertRaisesRegex(TaskStoreError, "task_invalid_state"):
+                    self.store.load_task(task_id)
+
+    def test_ingest_rejects_out_of_range_redis_time_without_writes(self) -> None:
+        event, identity, cursor = make_failure_event(qa_line(failure("time bound", seed=97)))
+        before = self._namespace_bytes()
+        clock = FixedLuaTime(self.redis, seconds=100_000_000_000)
+        result = TaskStore(clock).ingest_failure({"status": "missing"}, cursor, event, identity)
+        self.assertTrue(clock.injected)
+        self.assertEqual(result, {"status": "timestamp_out_of_range"})
+        self.assertEqual(self._namespace_bytes(), before)
+
+        clock = FixedLuaTime(self.redis, seconds=MAX_SAFE_TIMESTAMP_MS // 1000, microseconds=999_999)
+        result = TaskStore(clock).ingest_failure({"status": "missing"}, cursor, event, identity)
+        self.assertTrue(clock.injected)
+        self.assertEqual(result, {"status": "stored"})
+        task = self.store.load_task(identity["id"])
+        assert task is not None
+        self.assertEqual(task["created_at_ms"], MAX_SAFE_TIMESTAMP_MS)
+        self.assertEqual(task["updated_at_ms"], MAX_SAFE_TIMESTAMP_MS)
+
+    def test_ingest_lua_rejects_task_counter_at_2_to_53_before_any_write(self) -> None:
+        task_id = self._enqueue_counter_task()
+        raw = self._replace_task_counters(task_id, attempts=1 << 53)
+        before = self._counter_state(task_id)
+        event, identity, cursor = make_failure_event(
+            qa_line(failure("count drift at step 2: runtime=3 model=2", seed=95, step=2)),
+        )
+        self.assertEqual(identity["id"], task_id)
+        self.assertEqual(self.store.ingest_failure(self.store.read_cursor(), cursor, event, identity), {"status": "invalid_state"})
+        self.assertEqual(self._counter_state(task_id), before)
+        self.assertEqual(self.redis.get(task_key(task_id)), raw)
 
     def test_invalid_stored_boot_seed_rejects_before_namespace_write(self) -> None:
         for seed in (True, -1, 1 << 32):
