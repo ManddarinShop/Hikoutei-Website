@@ -1,11 +1,14 @@
 """QA cursor and observation persistence checks against isolated Redis 7."""
 
+import contextlib
 import hashlib
+import io
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -24,6 +27,7 @@ from task_store import (
     CURSOR_KEY, QUEUE_KEY, QUEUE_REGISTRY_KEY, TaskStore, TaskStoreError,
     observations_key, occurrence_key, task_key,
 )
+from watcher import tail_once
 
 TS = "2026-10-01T12:00:00.000Z"
 COUNTER_LIMIT = MAX_SAFE_COUNTER
@@ -1079,6 +1083,63 @@ class RedisBackedRecoveryTests(unittest.TestCase):
         self.assertIsNotNone(self.store.load_task(identity["id"]))
         self.assertEqual(self.store.observation_ids(identity["id"]), [event["occurrence_id"]])
         self.assertEqual(self.store.read_cursor()["value"], cursor)
+
+    def test_repeat_records_reuse_one_task_and_survive_restart(self) -> None:
+        first = failure("count drift at step 4: runtime=8 model=7", seed=12, step=4)
+        second = failure("count drift at step 91: runtime=100 model=99", seed=12, step=91, ts="2026-10-01T12:00:05.000Z")
+        records = [boot(12), first, second]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "qa-history.jsonl"
+            path.write_bytes(b"".join(map(qa_line, records)))
+            self.assertEqual(tail_once(self.store, str(path)), 3)
+            snapshot = self.store.read_cursor()
+            self.assertEqual(snapshot["status"], "stored")
+            self.assertEqual(snapshot["value"]["offset"], path.stat().st_size)
+            task_ids = self.store.queued_ids()
+            self.assertEqual(len(task_ids), 1)
+            self.assertEqual(self.redis.type(QUEUE_KEY), "stream")
+            self.assertEqual(self.redis.xlen(QUEUE_KEY), 1)
+            observations = self.store.observation_ids(task_ids[0])
+            self.assertEqual(len(observations), 2)
+            self.assertNotEqual(observations[0], observations[1])
+            task = self.store.load_task(task_ids[0])
+            self.assertIsNotNone(task)
+            self.assertEqual(task["mode"], "local")
+            restarted = TaskStore(self.redis)
+            self.assertEqual(tail_once(restarted, str(path)), 0)
+            self.assertEqual(restarted.observation_ids(task_ids[0]), observations)
+            self.assertEqual(restarted.queued_ids(), task_ids)
+
+    def test_partial_line_waits_then_poison_is_quarantined_before_advance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "qa-history.jsonl"
+            complete = qa_line(boot(5))
+            failure_bytes = qa_line(failure("expected revision 5, observed 4", seed=5))
+            split = len(failure_bytes) // 2
+            path.write_bytes(complete + failure_bytes[:split])
+            self.assertEqual(tail_once(self.store, str(path)), 1)
+            cursor_before = self.store.read_cursor()
+            self.assertEqual(cursor_before["value"]["offset"], len(complete))
+            with path.open("ab") as output:
+                output.write(failure_bytes[split:])
+            self.assertEqual(tail_once(self.store, str(path)), 1)
+            self.assertEqual(len(self.store.queued_ids()), 1)
+
+            poison = b"secret-value-that-must-not-be-logged\n"
+            with path.open("ab") as output:
+                output.write(poison + qa_line({"type": "unknown", "value": "safe"}))
+            captured = io.StringIO()
+            with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
+                self.assertEqual(tail_once(self.store, str(path)), 2)
+            self.assertNotIn("secret-value-that-must-not-be-logged", captured.getvalue())
+            stored_events = [
+                json.loads(self.redis.get(key))
+                for key in self.redis.scan_iter("ops:v2:occurrence:*")
+            ]
+            quarantined = [event for event in stored_events if event.get("kind") == "quarantined"]
+            self.assertEqual(len(quarantined), 2)
+            self.assertTrue(all(event["status"] == "blocked" for event in quarantined))
+            self.assertTrue(all("secret-value-that-must-not-be-logged" not in json.dumps(event) for event in quarantined))
 
 
 class StoreKeyBoundaryTests(unittest.TestCase):
