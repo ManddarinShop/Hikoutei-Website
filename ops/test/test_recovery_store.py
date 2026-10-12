@@ -109,6 +109,29 @@ def make_failure_event(raw: bytes, *, mode: str = "unknown") -> tuple[FailureOcc
     return event, identity, cursor
 
 
+class InjectLuaFailure:
+    def __init__(self, client, target: str):
+        self.client = client
+        self.target = target
+        self.injected = False
+
+    def __getattr__(self, name):
+        return getattr(self.client, name)
+
+    def eval(self, script, numkeys, *parts):
+        markers = {
+            "registration": "redis.call('XADD', KEYS[4], '*', 'task_id', ARGV[6])",
+            "finalize_registration": "redis.call('HSET', KEYS[5], ARGV[6], stream_id)",
+            "task": "redis.call('SET', KEYS[3], encoded_task)",
+            "observation_index": "redis.call('ZADD', KEYS[6], now_ms, ARGV[5])",
+        }
+        marker = markers[self.target]
+        if not self.injected and marker in script:
+            script = script.replace(marker, "redis.call('NO_SUCH_TEST_COMMAND')", 1)
+            self.injected = True
+        return self.client.eval(script, numkeys, *parts)
+
+
 class FixedLuaTime:
     marker = "local time = redis.call('TIME')"
 
@@ -169,38 +192,22 @@ class RedisBackedRecoveryTests(unittest.TestCase):
         self.store = TaskStore(self.redis)
 
     def _enqueue_counter_task(self) -> str:
-        raw = qa_line(failure("count drift at step 1: runtime=2 model=1", seed=95))
-        event, identity, cursor = make_failure_event(raw)
-        self.assertEqual(
-            self.store.ingest_failure(self.store.read_cursor(), cursor, event, identity),
-            {"status": "stored"},
-        )
-        return identity["id"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "qa-history.jsonl"
+            path.write_bytes(qa_line(failure("count drift at step 1: runtime=2 model=1", seed=95)))
+            self.assertEqual(tail_once(self.store, str(path)), 1)
+        return self.store.queued_ids()[0]
 
     def _enqueue_two_counter_tasks(self) -> list[str]:
-        first_raw = qa_line(failure("count drift at step 1: runtime=96 model=95", seed=95))
-        first_event, first_identity, first_cursor = make_failure_event(first_raw)
-        self.assertEqual(
-            self.store.ingest_failure(self.store.read_cursor(), first_cursor, first_event, first_identity),
-            {"status": "stored"},
-        )
-
-        second_raw = qa_line(failure("UNKNOWN expected revision 6, observed 5", seed=96))
-        second_event, second_identity, second_cursor = make_failure_event(second_raw)
-        offset = len(first_raw)
-        digest = hashlib.sha256(second_raw).hexdigest()
-        second_event["offset"] = offset
-        second_event["occurrence_id"] = make_occurrence_id(SOURCE, 1, 2, 0, offset, digest)
-        second_cursor["offset"] = offset + len(second_raw)
-        second_cursor["boundary_sha256"] = hashlib.sha256((first_raw + second_raw)[-128:]).hexdigest()
-        self.assertNotEqual(first_identity["id"], second_identity["id"], "fixtures must exercise two task registrations")
-        self.assertEqual(
-            self.store.ingest_failure(self.store.read_cursor(), second_cursor, second_event, second_identity),
-            {"status": "stored"},
-        )
-        task_ids = [first_identity["id"], second_identity["id"]]
-        self.assertEqual(self.redis.xlen(QUEUE_KEY), 2)
-        self.assertCountEqual(self.store.queued_ids(), task_ids)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "qa-history.jsonl"
+            path.write_bytes(
+                qa_line(failure("count drift at step 1: runtime=96 model=95", seed=95))
+                + qa_line(failure("expected revision 6, observed 5", seed=96))
+            )
+            self.assertEqual(tail_once(self.store, str(path)), 2)
+        task_ids = self.store.queued_ids()
+        self.assertEqual(len(task_ids), 2)
         return task_ids
 
     def _replace_task_counters(self, task_id: str, **counters: int) -> str:
@@ -1141,6 +1148,371 @@ class RedisBackedRecoveryTests(unittest.TestCase):
             self.assertTrue(all(event["status"] == "blocked" for event in quarantined))
             self.assertTrue(all("secret-value-that-must-not-be-logged" not in json.dumps(event) for event in quarantined))
 
+    def test_empty_new_active_file_blocks_and_retains_old_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "qa-history.jsonl"
+            path.write_bytes(qa_line(boot(83)))
+            self.assertEqual(tail_once(self.store, str(path)), 1)
+            before = self.store.read_cursor()
+            archive = path.with_suffix(".rotated")
+            path.rename(archive)
+            path.write_bytes(b"")
+            source_bytes = {archive: archive.read_bytes(), path: path.read_bytes()}
+
+            for restarted in (self.store, TaskStore(self.redis)):
+                with self.assertRaises(Exception) as blocked:
+                    tail_once(restarted, str(path))
+                self.assertEqual(getattr(blocked.exception, "code", None), "rotation_chain_unverified")
+                self.assertEqual(restarted.read_cursor()["raw"], before["raw"])
+                self.assertEqual({file: file.read_bytes() for file in source_bytes}, source_bytes)
+
+    def test_missing_bound_active_path_blocks_without_advancing_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "qa-history.jsonl"
+            self.assertEqual(tail_once(self.store, str(path)), 0)
+            path.write_bytes(qa_line(boot(84)))
+            self.assertEqual(tail_once(self.store, str(path)), 1)
+            before = self.store.read_cursor()
+            path.unlink()
+
+            with self.assertRaises(Exception) as blocked:
+                tail_once(self.store, str(path))
+            self.assertEqual(getattr(blocked.exception, "code", None), "active_file_missing")
+            self.assertEqual(self.store.read_cursor()["raw"], before["raw"])
+
+    def test_missing_rotation_archive_blocks_without_advancing_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "qa-history.jsonl"
+            path.write_bytes(qa_line(boot(92)))
+            self.assertEqual(tail_once(self.store, str(path)), 1)
+            before = self.store.read_cursor()
+            archive = root / "unavailable"
+            path.rename(archive)
+            archive.unlink()
+            path.write_bytes(qa_line(boot(93)) + qa_line(failure("must not skip old inode", seed=93)))
+
+            with self.assertRaises(Exception) as blocked:
+                tail_once(self.store, str(path))
+            self.assertEqual(getattr(blocked.exception, "code", None), "rotation_archive_missing")
+            self.assertEqual(self.store.read_cursor()["raw"], before["raw"])
+            self.assertEqual(len(self.store.queued_ids()), 0)
+
+    def test_same_inode_overwrite_is_explicitly_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "qa-history.jsonl"
+            original = qa_line(boot(1)) + qa_line(failure("count drift at step 1: runtime=2 model=1", seed=1))
+            path.write_bytes(original)
+            original_inode = path.stat().st_ino
+            self.assertEqual(tail_once(self.store, str(path)), 2)
+            cursor_before = self.store.read_cursor()
+
+            replacement = b"malformed-prefix\\n" + qa_line(boot(2)) + qa_line(
+                failure("count drift at step 2: runtime=3 model=2", seed=2)
+            )
+            with path.open("wb") as output:
+                output.write(replacement)
+            self.assertEqual(path.stat().st_ino, original_inode)
+            with self.assertRaises(Exception) as blocked:
+                tail_once(self.store, str(path))
+            self.assertEqual(getattr(blocked.exception, "code", None), "active_file_overwritten")
+            self.assertEqual(self.store.read_cursor()["raw"], cursor_before["raw"])
+
+    def test_processing_error_leaves_failure_cursor_pending_then_recovers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "qa-history.jsonl"
+            prefix = qa_line(boot(8))
+            raw = qa_line(failure("count drift at step 2: runtime=4 model=3", seed=8))
+            path.write_bytes(prefix)
+            self.assertEqual(tail_once(self.store, str(path)), 1)
+            cursor_before = self.store.read_cursor()
+            self.redis.set(QUEUE_KEY, "wrong-type")
+            with path.open("ab") as output:
+                output.write(raw)
+            with self.assertRaisesRegex(Exception, "ingest_rejected"):
+                tail_once(self.store, str(path))
+            self.assertEqual(self.store.read_cursor()["raw"], cursor_before["raw"])
+            self.assertEqual(self.redis.type(QUEUE_KEY), "string")
+            self.assertEqual(list(self.redis.scan_iter("ops:v2:task:*")), [])
+            self.assertEqual(
+                [json.loads(self.redis.get(key))["kind"] for key in self.redis.scan_iter("ops:v2:occurrence:*")],
+                ["boot"],
+            )
+            self.redis.delete(QUEUE_KEY)
+            self.assertEqual(tail_once(self.store, str(path)), 1)
+            self.assertEqual(len(self.store.queued_ids()), 1)
+
+    def test_pending_registration_with_matching_stream_entry_replays(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "qa-history.jsonl"
+            prefix = qa_line(boot(73))
+            path.write_bytes(prefix + qa_line(failure("finalize registration retry", seed=73)))
+            failing = InjectLuaFailure(self.redis, "finalize_registration")
+            with self.assertRaises(redis.exceptions.ResponseError):
+                tail_once(TaskStore(failing), str(path))
+
+            self.assertTrue(failing.injected)
+            self.assertEqual(self.store.read_cursor()["value"]["offset"], len(prefix))
+            task_id = next(iter(self.redis.hgetall(QUEUE_REGISTRY_KEY)))
+            self.assertEqual(self.redis.hget(QUEUE_REGISTRY_KEY, task_id), "__pending__")
+            self.assertEqual(self.store.queued_ids(), [task_id])
+            self.assertEqual(self.store.claim(task_id, "reviewer")["status"], "not_found")
+
+            self.assertEqual(tail_once(self.store, str(path)), 1)
+            self.assertEqual(self.redis.hget(QUEUE_REGISTRY_KEY, task_id), self.redis.xrange(QUEUE_KEY)[0][0])
+            self.assertEqual(self.store.queued_ids(), [task_id])
+            self.assertEqual(self.store.load_task(task_id)["status"], "queued")
+
+    def test_registration_command_failure_leaves_cursor_pending_and_retry_repairs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "qa-history.jsonl"
+            prefix = qa_line(boot(70))
+            path.write_bytes(prefix + qa_line(failure("registration failure retry", seed=70)))
+            failing = InjectLuaFailure(self.redis, "registration")
+            with self.assertRaises(redis.exceptions.ResponseError):
+                tail_once(TaskStore(failing), str(path))
+            self.assertTrue(failing.injected)
+            self.assertEqual(self.store.read_cursor()["value"]["offset"], len(prefix))
+            self.assertEqual(len(list(self.redis.scan_iter("ops:v2:occurrence:*"))), 2)
+            self.assertEqual(len(list(self.redis.scan_iter("ops:v2:task:*"))), 0)
+            before = self._namespace_bytes()
+            with self.assertRaisesRegex(TaskStoreError, "queue_registry_without_queue"):
+                self.store.queued_ids()
+            self.assertEqual(self._namespace_bytes(), before)
+
+            self.assertEqual(tail_once(self.store, str(path)), 1)
+            task_id = self.store.queued_ids()[0]
+            self.assertEqual(self.redis.type(QUEUE_KEY), "stream")
+            registrations = [
+                stream_id for stream_id, fields in self.redis.xrange(QUEUE_KEY)
+                if fields.get("task_id") == task_id
+            ]
+            self.assertEqual(len(registrations), 1)
+
+    def test_observation_index_failure_keeps_task_unclaimable_and_retry_repairs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "qa-history.jsonl"
+            prefix = qa_line(boot(72))
+            path.write_bytes(prefix + qa_line(failure("observation index failure retry", seed=72)))
+            failing = InjectLuaFailure(self.redis, "observation_index")
+            with self.assertRaises(redis.exceptions.ResponseError):
+                tail_once(TaskStore(failing), str(path))
+            self.assertTrue(failing.injected)
+            self.assertEqual(self.store.read_cursor()["value"]["offset"], len(prefix))
+            task_id = self.redis.xrange(QUEUE_KEY)[0][1]["task_id"]
+            stream_id = self.redis.xrange(QUEUE_KEY)[0][0]
+            self.assertEqual(self.redis.hget(QUEUE_REGISTRY_KEY, task_id), stream_id)
+            self.assertEqual(self.store.observation_ids(task_id), [])
+            self.assertEqual(self.store.queued_ids(), [task_id])
+            self.assertEqual(self.store.claim(task_id, "reviewer")["status"], "not_found")
+
+            self.assertEqual(tail_once(TaskStore(self.redis), str(path)), 1)
+            occurrence_ids = [
+                key.rsplit(":", 1)[-1]
+                for key in self.redis.scan_iter("ops:v2:occurrence:*")
+                if json.loads(self.redis.get(key))["kind"] == "failure"
+            ]
+            self.assertEqual(self.store.observation_ids(task_id), occurrence_ids)
+            self.assertEqual(self.store.load_task(task_id)["status"], "queued")
+            self.assertEqual(self.redis.xlen(QUEUE_KEY), 1)
+            self.assertEqual(tail_once(TaskStore(self.redis), str(path)), 0)
+            self.assertEqual(self.redis.xlen(QUEUE_KEY), 1)
+
+    def test_registration_survives_later_task_write_failure_and_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "qa-history.jsonl"
+            prefix = qa_line(boot(71))
+            path.write_bytes(prefix + qa_line(failure("task write failure retry", seed=71)))
+            failing = InjectLuaFailure(self.redis, "task")
+            with self.assertRaises(redis.exceptions.ResponseError):
+                tail_once(TaskStore(failing), str(path))
+            self.assertTrue(failing.injected)
+            self.assertEqual(self.store.read_cursor()["value"]["offset"], len(prefix))
+            self.assertEqual(self.redis.type(QUEUE_KEY), "stream")
+            task_id = self.redis.xrange(QUEUE_KEY)[0][1]["task_id"]
+            self.assertIn(task_id, self.store.queued_ids())
+            self.assertIsNone(self.store.load_task(task_id))
+
+            self.assertEqual(tail_once(self.store, str(path)), 1)
+            self.assertEqual(self.store.load_task(task_id)["status"], "queued")
+            registrations = [
+                stream_id for stream_id, fields in self.redis.xrange(QUEUE_KEY)
+                if fields.get("task_id") == task_id
+            ]
+            self.assertEqual(len(registrations), 1)
+
+    def test_quarantine_resets_boot_context_across_restart_until_valid_boot(self) -> None:
+        malformed_lines = (
+            qa_line({"type": "boot", "ts": TS, "seed": 72, "syncMode": "sync", "extra": True}),
+            b"x" * (1024 * 1024 + 1) + b"\n",
+        )
+        for mode in ("local", "sync"):
+            for malformed in malformed_lines:
+                with self.subTest(mode=mode, malformed_bytes=len(malformed)):
+                    self.redis.flushdb()
+                    self.store = TaskStore(self.redis)
+                    with tempfile.TemporaryDirectory() as directory:
+                        path = Path(directory) / "qa-history.jsonl"
+                        path.write_bytes(qa_line(boot(72, mode)) + malformed)
+                        self.assertEqual(tail_once(self.store, str(path)), 2)
+                        self.assertEqual(self.store.read_cursor()["value"]["boot_context"], {"status": "unknown"})
+
+                        restarted = TaskStore(self.redis)
+                        with path.open("ab") as output:
+                            output.write(qa_line(failure("same seed after poison", seed=72)))
+                        self.assertEqual(tail_once(restarted, str(path)), 1)
+                        task_id = restarted.queued_ids()[0]
+                        self.assertEqual(restarted.load_task(task_id)["mode"], "unknown")
+
+                        with path.open("ab") as output:
+                            output.write(qa_line(boot(72, mode)) + qa_line(failure("mode restored", seed=72)))
+                        self.assertEqual(tail_once(restarted, str(path)), 2)
+                        modes = {restarted.load_task(key)["mode"] for key in restarted.queued_ids()}
+                        self.assertIn("unknown", modes)
+                        self.assertIn(mode, modes)
+
+    def test_observation_index_retry_does_not_reset_existing_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "qa-history.jsonl"
+            first = qa_line(failure("count drift at step 4: runtime=8 model=7", seed=12, step=4))
+            second = qa_line(failure("count drift at step 5: runtime=8 model=7", seed=12, step=5))
+            path.write_bytes(qa_line(boot(12)) + first)
+            self.assertEqual(tail_once(self.store, str(path)), 2)
+            task_id = self.store.queued_ids()[0]
+            claimed = self.store.claim(task_id, "reviewer")
+            self.assertEqual(claimed["status"], "claimed")
+            before_task = claimed["task"]
+            before_observations = self.store.observation_ids(task_id)
+            with path.open("ab") as output:
+                output.write(second)
+
+            failing = InjectLuaFailure(self.redis, "observation_index")
+            with self.assertRaises(redis.exceptions.ResponseError):
+                tail_once(TaskStore(failing), str(path))
+            self.assertTrue(failing.injected)
+            self.assertEqual(self.store.read_cursor()["value"]["offset"], len(qa_line(boot(12))) + len(first))
+            self.assertEqual(self.store.load_task(task_id), before_task)
+            self.assertEqual(self.store.observation_ids(task_id), before_observations)
+
+            self.assertEqual(tail_once(TaskStore(self.redis), str(path)), 1)
+            self.assertEqual(self.store.load_task(task_id), before_task)
+            self.assertEqual(len(self.store.observation_ids(task_id)), 2)
+            self.assertEqual(self.redis.xlen(QUEUE_KEY), 1)
+
+    def test_partial_initial_file_stays_bound_through_restart_and_archive_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "qa-history.jsonl"
+            original_line = qa_line(boot(87))
+            split = len(original_line) // 2
+            path.write_bytes(original_line[:split])
+            self.assertEqual(tail_once(self.store, str(path)), 0)
+            initial = self.store.read_cursor()
+            self.assertEqual(initial["status"], "stored")
+            original_inode = path.stat().st_ino
+
+            restarted = TaskStore(self.redis)
+            self.assertEqual(tail_once(restarted, str(path)), 0)
+            self.assertEqual(restarted.read_cursor()["raw"], initial["raw"])
+            archive = path.with_suffix(".rotated")
+            path.rename(archive)
+            path.write_bytes(qa_line(boot(88)))
+            with self.assertRaises(Exception) as incomplete:
+                tail_once(restarted, str(path))
+            self.assertEqual(getattr(incomplete.exception, "code", None), "rotation_archive_incomplete")
+            self.assertEqual(restarted.read_cursor()["raw"], initial["raw"])
+
+            with archive.open("ab") as output:
+                output.write(original_line[split:])
+            with self.assertRaises(Exception) as blocked:
+                tail_once(TaskStore(self.redis), str(path))
+            self.assertEqual(getattr(blocked.exception, "code", None), "rotation_chain_unverified")
+            cursor = self.store.read_cursor()["value"]
+            self.assertEqual(cursor["file"]["inode"], original_inode)
+            self.assertEqual(cursor["offset"], len(original_line))
+            events = [json.loads(self.redis.get(key)) for key in self.redis.scan_iter("ops:v2:occurrence:*")]
+            self.assertEqual([event["record"]["seed"] for event in events if event["kind"] == "boot"], [87])
+
+    def test_unverified_a_to_b_to_c_rotation_blocks_without_skipping_or_mutating_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "qa-history.jsonl"
+            initial = qa_line(boot(80, "sync")) + qa_line(failure("first sync incident", seed=80))
+            path.write_bytes(initial)
+            self.assertEqual(tail_once(self.store, str(path)), 2)
+            before = self.store.read_cursor()["value"]
+
+            pending = qa_line(failure("last safely drained A record", seed=80))
+            with path.open("ab") as output:
+                output.write(pending)
+            archive_a = path.with_suffix(".A")
+            path.rename(archive_a)
+            bytes_b = qa_line(boot(81, "local")) + qa_line(failure("must not ingest B", seed=81))
+            path.write_bytes(bytes_b)
+            archive_b = path.with_suffix(".B")
+            path.rename(archive_b)
+            bytes_c = qa_line(boot(82, "sync")) + qa_line(failure("must not ingest C", seed=82))
+            path.write_bytes(bytes_c)
+            source_bytes = {file: file.read_bytes() for file in (archive_a, archive_b, path)}
+
+            for restarted in (self.store, TaskStore(self.redis), TaskStore(self.redis)):
+                with self.assertRaises(Exception) as blocked:
+                    tail_once(restarted, str(path))
+                self.assertEqual(getattr(blocked.exception, "code", None), "rotation_chain_unverified")
+                cursor = restarted.read_cursor()["value"]
+                self.assertEqual(cursor["file"]["inode"], archive_a.stat().st_ino)
+                self.assertEqual(cursor["generation"], before["generation"])
+                self.assertEqual(cursor["offset"], len(initial) + len(pending))
+                events = [json.loads(self.redis.get(key)) for key in self.redis.scan_iter("ops:v2:occurrence:*")]
+                failure_details = {event["record"]["detail"] for event in events if event["kind"] == "failure"}
+                self.assertEqual(failure_details, {"first sync incident", "last safely drained A record"})
+                self.assertEqual(len(restarted.queued_ids()), 2)
+                self.assertEqual(self.redis.xlen(QUEUE_KEY), 2)
+                self.assertEqual({file: file.read_bytes() for file in source_bytes}, source_bytes)
+
+    def test_rotation_drains_complete_prefix_then_blocks_partial_archive_line(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "qa-history.jsonl"
+            initial = qa_line(boot(90, "local"))
+            path.write_bytes(initial)
+            self.assertEqual(tail_once(self.store, str(path)), 1)
+            summary = qa_line({
+                "type": "summary", "ts": TS, "seed": 90, "iterations": 1, "failures": 0,
+                "uptimeS": 1, "opCounters": {name: {"total": 0, "ok": 0, "fail": 0} for name in (
+                    "create", "update", "delete", "duplicateInsert", "noOpUpdate", "deleteRecreate", "flushCycle")},
+            })
+            partial = qa_line(failure("partial archive failure", seed=90))
+            split = len(partial) // 2
+            with path.open("ab") as output:
+                output.write(summary + partial[:split])
+            archive = path.with_suffix(".rotated")
+            path.rename(archive)
+            path.write_bytes(qa_line(boot(91, "sync")) + qa_line(failure("new file failure", seed=91)))
+
+            with self.assertRaises(Exception) as blocked:
+                tail_once(self.store, str(path))
+            self.assertEqual(getattr(blocked.exception, "code", None), "rotation_archive_incomplete")
+            cursor = self.store.read_cursor()["value"]
+            self.assertEqual(cursor["file"]["inode"], archive.stat().st_ino)
+            self.assertEqual(cursor["offset"], len(initial) + len(summary))
+            self.assertEqual(len(self.store.queued_ids()), 0)
+
+            with archive.open("ab") as output:
+                output.write(partial[split:])
+            active_bytes, archive_bytes = path.read_bytes(), archive.read_bytes()
+            with self.assertRaises(Exception) as blocked:
+                tail_once(TaskStore(self.redis), str(path))
+            self.assertEqual(getattr(blocked.exception, "code", None), "rotation_chain_unverified")
+            cursor = self.store.read_cursor()["value"]
+            self.assertEqual(cursor["file"]["inode"], archive.stat().st_ino)
+            self.assertEqual(cursor["offset"], len(initial) + len(summary) + len(partial))
+            task_ids = self.store.queued_ids()
+            self.assertEqual(len(task_ids), 1)
+            self.assertEqual(self.store.load_task(task_ids[0])["mode"], "local")
+            events = [json.loads(self.redis.get(key)) for key in self.redis.scan_iter("ops:v2:occurrence:*")]
+            self.assertEqual(
+                {event["record"]["detail"] for event in events if event["kind"] == "failure"},
+                {"partial archive failure"},
+            )
+            self.assertEqual((path.read_bytes(), archive.read_bytes()), (active_bytes, archive_bytes))
 
 class StoreKeyBoundaryTests(unittest.TestCase):
     def test_observations_key_preserves_valid_task_key(self):
