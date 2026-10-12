@@ -8,7 +8,7 @@ from typing import Any, Literal, TypeAlias, TypedDict, cast
 from task_contracts import (
     Cursor, CursorValidation, EventValidation, FailureOccurrence, IncidentIdentity,
     MAX_SAFE_COUNTER, QueuedTask, StoredEvent, TaskState, TaskValidation,
-    is_safe_counter, is_safe_timestamp_ms, is_valid_owner, queued_task, stable_json,
+    is_safe_counter, is_safe_timestamp_ms, is_valid_owner, queued_task, safe_code, stable_json,
     validate_cursor, validate_stored_event, validate_task,
 )
 
@@ -75,6 +75,22 @@ class LeaseStatus(TypedDict):
 
 
 LeaseResult: TypeAlias = LeaseUpdated | LeaseStatus
+
+
+class Transitioned(TypedDict):
+    status: Literal["transitioned"]
+    task: TaskState
+
+
+class TransitionStatus(TypedDict):
+    status: Literal[
+        "stale_state", "stale_owner", "expired", "invalid_transition",
+        "not_found", "wrong_type", "invalid_state", "counter_exhausted",
+        "timestamp_out_of_range",
+    ]
+
+
+TransitionResult: TypeAlias = Transitioned | TransitionStatus
 
 
 class TaskStoreError(RuntimeError):
@@ -476,6 +492,82 @@ redis.call('SET', KEYS[1], encoded)
 return {'renewed', encoded}
 """
 
+_TRANSITION = r"""
+local MAX_SAFE_COUNTER = 2147483647
+local MAX_SAFE_TIMESTAMP_MS = 99999999999999
+local function safe_counter(value)
+  return type(value) == 'number' and value >= 0 and value <= MAX_SAFE_COUNTER
+      and value == math.floor(value)
+end
+local function safe_timestamp_ms(value)
+  return type(value) == 'number' and value >= 0 and value <= MAX_SAFE_TIMESTAMP_MS
+      and value == math.floor(value)
+end
+local function task_timestamps_valid(task)
+  if not safe_timestamp_ms(task.created_at_ms) or not safe_timestamp_ms(task.updated_at_ms)
+      or type(task.error) ~= 'table' then return false end
+  if task.error.status == 'recorded' then
+    if not safe_timestamp_ms(task.error.at_ms) then return false end
+  elseif task.error.status ~= 'none' then return false end
+  if task.status == 'investigating' then return safe_timestamp_ms(task.lease_until_ms) end
+  if task.status == 'blocked' then return safe_timestamp_ms(task.blocked_at_ms) end
+  return task.status == 'queued'
+end
+local function current_time_ms()
+  local time = redis.call('TIME')
+  local seconds = tonumber(time[1])
+  local microseconds = tonumber(time[2])
+  if type(seconds) ~= 'number' or seconds < 0 or seconds ~= math.floor(seconds)
+      or type(microseconds) ~= 'number' or microseconds < 0
+      or microseconds >= 1000000 or microseconds ~= math.floor(microseconds) then return nil end
+  local now_ms = seconds * 1000 + math.floor(microseconds / 1000)
+  if not safe_timestamp_ms(now_ms) then return nil end
+  return now_ms
+end
+local task_type = redis.call('TYPE', KEYS[1]).ok
+if task_type ~= 'none' and task_type ~= 'string' then return {'wrong_type'} end
+if task_type == 'none' then return {'not_found'} end
+local target = ARGV[2]
+local raw = redis.call('GET', KEYS[1])
+if raw ~= ARGV[1] then return {'stale_state'} end
+local ok, task = pcall(cjson.decode, raw)
+if not ok or type(task) ~= 'table' or task.schema_version ~= 2
+    or type(task.status) ~= 'string' or type(task.epoch) ~= 'number'
+    or not safe_counter(task.revision) or not task_timestamps_valid(task) then
+  return {'invalid_state'}
+end
+local transitions = {
+  queued = {blocked=true},
+  investigating = {queued=true, blocked=true},
+  blocked = {queued=true}
+}
+if not transitions[task.status] or not transitions[task.status][target] then
+  return {'invalid_transition'}
+end
+local now_ms = current_time_ms()
+if now_ms == nil then return {'timestamp_out_of_range'} end
+if task.status == 'investigating' then
+  if task.owner ~= ARGV[3] or task.epoch ~= tonumber(ARGV[4]) then return {'stale_owner'} end
+  if type(task.lease_until_ms) ~= 'number' then return {'invalid_state'} end
+  if task.lease_until_ms <= now_ms then return {'expired'} end
+end
+if task.revision == MAX_SAFE_COUNTER then return {'counter_exhausted'} end
+for _, field in ipairs({'owner', 'lease_until_ms', 'reason_code', 'blocked_at_ms'}) do
+  task[field] = nil
+end
+task.status = target
+task.revision = task.revision + 1
+task.updated_at_ms = now_ms
+if target == 'blocked' then
+  task.reason_code = ARGV[5]
+  task.blocked_at_ms = now_ms
+  task.error = {status='recorded', code=ARGV[5], at_ms=now_ms}
+end
+local encoded = cjson.encode(task)
+redis.call('SET', KEYS[1], encoded)
+return {'transitioned', encoded}
+"""
+
 _READ_QUEUE_SNAPSHOT = r"""
 local registry_type = redis.call('TYPE', KEYS[1]).ok
 local queue_type = redis.call('TYPE', KEYS[2]).ok
@@ -540,6 +632,49 @@ class TaskStore:
         if status != "renewed":
             return {"status": cast(Any, status)}
         return {"status": "renewed", "task": self._decode_task(reply[1])}
+
+    def transition(
+        self,
+        task_id: str,
+        target: Literal["queued", "blocked"],
+        *,
+        expected_revision: int,
+        owner: str = "",
+        epoch: int = -1,
+        reason_code: str = "",
+    ) -> TransitionResult:
+        """Compare-and-set a Phase 1 edge; investigating tasks require their live lease."""
+        if not self._nonnegative_int(expected_revision):
+            raise TaskStoreError("invalid_revision")
+        if target not in ("queued", "blocked"):
+            raise TaskStoreError("invalid_transition_target")
+        if target == "blocked":
+            reason_code = safe_code(reason_code)
+        snapshot = self._read_task_snapshot(task_id)
+        if snapshot is None:
+            return {"status": "not_found"}
+        raw, state = snapshot
+        if state["revision"] != expected_revision:
+            return {"status": "stale_state"}
+        reply = self._client.eval(
+            _TRANSITION, 1, task_key(task_id), raw, target, owner, epoch, reason_code,
+        )
+        status = self._reply_status(reply)
+        if status != "transitioned":
+            return {"status": cast(Any, status)}
+        return {"status": "transitioned", "task": self._decode_task(reply[1])}
+
+    def release(
+        self,
+        task_id: str,
+        owner: str,
+        epoch: int,
+        expected_revision: int,
+    ) -> TransitionResult:
+        """Return a live owner's task to queued state without resetting its attempt history."""
+        return self.transition(
+            task_id, "queued", expected_revision=expected_revision, owner=owner, epoch=epoch,
+        )
 
     def load_task(self, task_id: str) -> TaskState | None:
         """Load one durable task only after strict lifecycle validation."""
