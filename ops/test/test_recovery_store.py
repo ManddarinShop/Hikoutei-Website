@@ -592,6 +592,269 @@ class RedisBackedRecoveryTests(unittest.TestCase):
         assert stored is not None
         self.assertEqual(stored["revision"], COUNTER_LIMIT)
 
+    def test_transition_rejects_malformed_target_reason_and_revision(self) -> None:
+        task_id = self._enqueue_counter_task()
+        before = self._namespace_bytes()
+        with self.assertRaisesRegex(TaskStoreError, "invalid_revision"):
+            self.store.transition(task_id, "blocked", expected_revision=True, reason_code="bad")
+        with self.assertRaisesRegex(TaskStoreError, "invalid_transition_target"):
+            self.store.transition(task_id, "investigating", expected_revision=0)
+        with self.assertRaisesRegex(ValueError, "invalid_reason_code"):
+            self.store.transition(task_id, "blocked", expected_revision=0, reason_code="raw message!")
+        self.assertEqual(self._namespace_bytes(), before)
+
+    def test_transition_exhaustion_preserves_state_and_stale_owner_still_fails(self) -> None:
+        task_id = self._enqueue_counter_task()
+        claimed = self.store.claim(task_id, "worker")
+        assert claimed["status"] == "claimed"
+        self._replace_task_counters(task_id, revision=COUNTER_LIMIT)
+        before = self._counter_state(task_id)
+        self.assertEqual(
+            self.store.release(task_id, "stale", claimed["task"]["epoch"], COUNTER_LIMIT)["status"],
+            "stale_owner",
+        )
+        self.assertEqual(self._counter_state(task_id), before)
+        self.assertEqual(
+            self.store.release(task_id, "worker", claimed["task"]["epoch"], COUNTER_LIMIT)["status"],
+            "counter_exhausted",
+        )
+        self.assertEqual(self._counter_state(task_id), before)
+
+    def test_transition_increments_max_minus_one_revision_exactly(self) -> None:
+        task_id = self._enqueue_counter_task()
+        claimed = self.store.claim(task_id, "worker")
+        assert claimed["status"] == "claimed"
+        self._replace_task_counters(task_id, revision=COUNTER_LIMIT - 1)
+        result = self.store.release(task_id, "worker", claimed["task"]["epoch"], COUNTER_LIMIT - 1)
+        self.assertEqual(result["status"], "transitioned")
+        assert result["status"] == "transitioned"
+        self.assertEqual(result["task"]["revision"], COUNTER_LIMIT)
+        self.assertEqual(self.store.load_task(task_id)["revision"], COUNTER_LIMIT)
+
+    def test_release_missing_queued_and_wrong_type_states_do_not_write(self) -> None:
+        task_id = self._enqueue_counter_task()
+        before = self._namespace_bytes()
+        self.assertEqual(self.store.release("inc_" + "0" * 64, "worker", 1, 0)["status"], "not_found")
+        self.assertEqual(self.store.release(task_id, "worker", 0, 0)["status"], "invalid_transition")
+        self.assertEqual(self._namespace_bytes(), before)
+
+        self.redis.delete(task_key(task_id))
+        self.redis.lpush(task_key(task_id), "wrong-type")
+        before = self._namespace_bytes()
+        with self.assertRaisesRegex(TaskStoreError, "task_wrong_type"):
+            self.store.release(task_id, "worker", 1, 0)
+        self.assertEqual(self._namespace_bytes(), before)
+
+    def test_release_fences_owner_epoch_revision_and_expiry_without_writes(self) -> None:
+        task_id = self._enqueue_counter_task()
+        claimed = self.store.claim(task_id, "worker")
+        assert claimed["status"] == "claimed"
+        active = claimed["task"]
+        for owner, epoch, revision, status in (
+            ("stale", active["epoch"], active["revision"], "stale_owner"),
+            ("worker", active["epoch"] + 1, active["revision"], "stale_owner"),
+            ("worker", active["epoch"], active["revision"] - 1, "stale_state"),
+        ):
+            before = self._namespace_bytes()
+            self.assertEqual(self.store.release(task_id, owner, epoch, revision)["status"], status)
+            self.assertEqual(self._namespace_bytes(), before)
+
+        expired = {**active, "lease_until_ms": 0}
+        expired_raw = stable_json(expired)
+        self.redis.set(task_key(task_id), expired_raw)
+        before = self._namespace_bytes()
+        self.assertEqual(
+            self.store.release(task_id, "worker", active["epoch"], active["revision"])["status"],
+            "expired",
+        )
+        self.assertEqual(self.redis.get(task_key(task_id)), expired_raw)
+        self.assertEqual(self._namespace_bytes(), before)
+
+        self.redis.set(task_key(task_id), stable_json(active))
+        released = self.store.release(task_id, "worker", active["epoch"], active["revision"])
+        self.assertEqual(released["status"], "transitioned")
+        assert released["status"] == "transitioned"
+        self.assertEqual(released["task"]["status"], "queued")
+        self.assertEqual((released["task"]["attempts"], released["task"]["epoch"]), (1, 1))
+        self.assertEqual(released["task"]["revision"], active["revision"] + 1)
+        self.assertNotIn("owner", released["task"])
+        self.assertNotIn("lease_until_ms", released["task"])
+        self.assertEqual(self.store.queued_ids(), [task_id])
+
+    def test_transition_revision_cas_allows_only_one_racing_writer(self) -> None:
+        task_id = self._enqueue_counter_task()
+        barrier = Barrier(2)
+
+        def block(reason_code: str):
+            barrier.wait()
+            return self.store.transition(task_id, "blocked", expected_revision=0, reason_code=reason_code)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(block, ("first_reason", "second_reason")))
+        self.assertCountEqual([result["status"] for result in results], ["transitioned", "stale_state"])
+        task = self.store.load_task(task_id)
+        assert task is not None
+        self.assertEqual(task["status"], "blocked")
+        self.assertEqual(task["revision"], 1)
+        self.assertIn(task["reason_code"], ("first_reason", "second_reason"))
+
+    def test_transition_rejects_malformed_raw_state_without_mutation(self) -> None:
+        task_id = self._enqueue_counter_task()
+        task = self.store.load_task(task_id)
+        assert task is not None
+        raw = stable_json({**task, "attempts": 1 << 53})
+        self.redis.set(task_key(task_id), raw)
+        before = self._namespace_bytes()
+        with self.assertRaisesRegex(TaskStoreError, "task_invalid_state"):
+            self.store.transition(task_id, "blocked", expected_revision=0, reason_code="invalid_state")
+        self.assertEqual(self._namespace_bytes(), before)
+        self.assertEqual(self.redis.get(task_key(task_id)), raw)
+
+    def test_blocked_error_and_requeue_attempt_history_are_durable(self) -> None:
+        task_id = self._enqueue_counter_task()
+        blocked = self.store.transition(task_id, "blocked", expected_revision=0, reason_code="malformed_input")
+        self.assertEqual(blocked["task"]["status"], "blocked")
+        self.assertEqual(blocked["task"]["error"], {
+            "status": "recorded", "code": "malformed_input", "at_ms": blocked["task"]["blocked_at_ms"],
+        })
+        queued = self.store.transition(task_id, "queued", expected_revision=blocked["task"]["revision"])
+        self.assertEqual(queued["task"]["status"], "queued")
+        self.assertEqual(queued["task"]["error"]["code"], "malformed_input")
+        self.assertEqual(queued["task"]["attempts"], 0)
+        claimed = self.store.claim(task_id, "worker")
+        assert claimed["status"] == "claimed"
+        blocked_again = self.store.transition(
+            task_id, "blocked", expected_revision=claimed["task"]["revision"],
+            owner="worker", epoch=claimed["task"]["epoch"], reason_code="retry_blocked",
+        )
+        assert blocked_again["status"] == "transitioned"
+        requeued = self.store.transition(
+            task_id, "queued", expected_revision=blocked_again["task"]["revision"],
+        )
+        assert requeued["status"] == "transitioned"
+        self.assertEqual((requeued["task"]["attempts"], requeued["task"]["epoch"]), (1, 1))
+        self.assertEqual(requeued["task"]["error"]["code"], "retry_blocked")
+        self.assertEqual(self.store.queued_ids(), [task_id])
+        self.assertEqual(self.redis.xlen(QUEUE_KEY), 1)
+
+    def test_lifecycle_transitions_keep_state_shapes_and_error_codes(self) -> None:
+        task_id = self._enqueue_counter_task()
+        claimed = self.store.claim(task_id, "reviewer", lease_seconds=30)
+        assert claimed["status"] == "claimed"
+        investigating = claimed["task"]
+        for forbidden in ("fixing", "verifying", "reviewing", "pr_open", "awaiting_merge", "resolved"):
+            with self.subTest(target=forbidden), self.assertRaisesRegex(TaskStoreError, "invalid_transition_target"):
+                self.store.transition(task_id, forbidden, expected_revision=investigating["revision"])
+        stale = self.store.transition(
+            task_id, "blocked", expected_revision=investigating["revision"],
+            owner="stale-owner", epoch=investigating["epoch"] - 1, reason_code="stale_owner",
+        )
+        self.assertEqual(stale["status"], "stale_owner")
+        blocked = self.store.transition(
+            task_id, "blocked", expected_revision=investigating["revision"],
+            owner="reviewer", epoch=investigating["epoch"], reason_code="awaiting_evidence",
+        )
+        self.assertEqual(blocked["task"]["status"], "blocked")
+        self.assertNotIn("owner", blocked["task"])
+        self.assertNotIn("lease_until_ms", blocked["task"])
+        self.assertEqual(self.redis.xlen(QUEUE_KEY), 1)
+
+    def test_max_timestamp_round_trips_through_claim_transition_and_release(self) -> None:
+        task_id = self._enqueue_counter_task()
+        task = self.store.load_task(task_id)
+        assert task is not None
+        task = {
+            **task,
+            "created_at_ms": MAX_SAFE_TIMESTAMP_MS,
+            "updated_at_ms": MAX_SAFE_TIMESTAMP_MS,
+            "error": {"status": "recorded", "code": "prior_error", "at_ms": MAX_SAFE_TIMESTAMP_MS},
+        }
+        self.redis.set(task_key(task_id), stable_json(task))
+        now_ms = MAX_SAFE_TIMESTAMP_MS - 1_000
+        clock = FixedLuaTime(self.redis, now_ms // 1000, (now_ms % 1000) * 1000)
+        claimed = TaskStore(clock).claim(task_id, "worker", lease_seconds=1)
+        self.assertTrue(clock.injected)
+        assert claimed["status"] == "claimed"
+        self.assertEqual(claimed["task"]["created_at_ms"], MAX_SAFE_TIMESTAMP_MS)
+        self.assertEqual(claimed["task"]["error"]["at_ms"], MAX_SAFE_TIMESTAMP_MS)
+        released = TaskStore(clock).release(
+            task_id, "worker", claimed["task"]["epoch"], claimed["task"]["revision"],
+        )
+        self.assertEqual(released["status"], "transitioned")
+        assert released["status"] == "transitioned"
+        self.assertEqual(released["task"]["created_at_ms"], MAX_SAFE_TIMESTAMP_MS)
+        self.assertEqual(released["task"]["error"]["at_ms"], MAX_SAFE_TIMESTAMP_MS)
+
+        claimed_again = self.store.claim(task_id, "worker")
+        assert claimed_again["status"] == "claimed"
+        blocked = self.store.transition(
+            task_id, "blocked", expected_revision=claimed_again["task"]["revision"],
+            owner="worker", epoch=claimed_again["task"]["epoch"], reason_code="finished",
+        )
+        self.assertEqual(blocked["status"], "transitioned")
+        assert blocked["status"] == "transitioned"
+        self.assertEqual(blocked["task"]["created_at_ms"], MAX_SAFE_TIMESTAMP_MS)
+        self.assertEqual(blocked["task"]["error"]["at_ms"], blocked["task"]["blocked_at_ms"])
+
+        max_blocked = {
+            **blocked["task"],
+            "updated_at_ms": MAX_SAFE_TIMESTAMP_MS,
+            "blocked_at_ms": MAX_SAFE_TIMESTAMP_MS,
+            "error": {"status": "recorded", "code": "finished", "at_ms": MAX_SAFE_TIMESTAMP_MS},
+        }
+        self.redis.set(task_key(task_id), stable_json(max_blocked))
+        queued = self.store.transition(task_id, "queued", expected_revision=max_blocked["revision"])
+        self.assertEqual(queued["status"], "transitioned")
+        assert queued["status"] == "transitioned"
+        self.assertEqual(queued["task"]["created_at_ms"], MAX_SAFE_TIMESTAMP_MS)
+        self.assertEqual(queued["task"]["error"]["at_ms"], MAX_SAFE_TIMESTAMP_MS)
+
+    def test_invalid_lifecycle_edges_do_not_write(self) -> None:
+        task_id = self._enqueue_counter_task()
+        before = self._namespace_bytes()
+        self.assertEqual(self.store.transition(task_id, "queued", expected_revision=0)["status"], "invalid_transition")
+        blocked = self.store.transition(task_id, "blocked", expected_revision=0, reason_code="blocked")
+        assert blocked["status"] == "transitioned"
+        before = self._namespace_bytes()
+        self.assertEqual(
+            self.store.transition(
+                task_id, "blocked", expected_revision=blocked["task"]["revision"], reason_code="blocked",
+            )["status"],
+            "invalid_transition",
+        )
+        self.assertEqual(self._namespace_bytes(), before)
+
+    def test_transition_and_release_time_bounds_reject_before_writes(self) -> None:
+        task_id = self._enqueue_counter_task()
+        claimed = self.store.claim(task_id, "worker")
+        assert claimed["status"] == "claimed"
+        before = self._namespace_bytes()
+        clock = FixedLuaTime(self.redis, seconds=MAX_SAFE_TIMESTAMP_MS // 1000 + 1)
+        result = TaskStore(clock).release(
+            task_id, "worker", claimed["task"]["epoch"], claimed["task"]["revision"],
+        )
+        self.assertTrue(clock.injected)
+        self.assertEqual(result["status"], "timestamp_out_of_range")
+        self.assertEqual(self._namespace_bytes(), before)
+
+        self.redis.flushdb()
+        self.store = TaskStore(self.redis)
+        task_id = self._enqueue_counter_task()
+        clock = FixedLuaTime(
+            self.redis,
+            seconds=MAX_SAFE_TIMESTAMP_MS // 1000,
+            microseconds=999_999,
+        )
+        blocked = TaskStore(clock).transition(
+            task_id, "blocked", expected_revision=0, reason_code="max_time",
+        )
+        self.assertTrue(clock.injected)
+        self.assertEqual(blocked["status"], "transitioned")
+        assert blocked["status"] == "transitioned"
+        self.assertEqual(blocked["task"]["updated_at_ms"], MAX_SAFE_TIMESTAMP_MS)
+        self.assertEqual(blocked["task"]["blocked_at_ms"], MAX_SAFE_TIMESTAMP_MS)
+        self.assertEqual(blocked["task"]["error"]["at_ms"], MAX_SAFE_TIMESTAMP_MS)
+
     def test_owner_uses_utf8_byte_limit_for_input_and_stored_task_validation(self) -> None:
         task_id = self._enqueue_counter_task()
         queued = self.store.load_task(task_id)
