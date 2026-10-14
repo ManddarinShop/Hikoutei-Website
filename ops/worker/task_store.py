@@ -5,6 +5,16 @@ import hashlib
 import json
 import re
 from typing import Any, Literal, TypeAlias, TypedDict, cast
+from ci_contracts import (
+    CIEvent,
+    CICursor,
+    CICursorSnapshot,
+    MAX_CI_PAGE,
+    ci_cursor_key,
+    initial_ci_cursor,
+    validate_ci_cursor,
+    validate_ci_event,
+)
 from task_contracts import (
     Cursor, CursorValidation, EventValidation, FailureOccurrence, IncidentIdentity,
     MAX_SAFE_COUNTER, QueuedTask, StoredEvent, TaskState, TaskValidation,
@@ -148,7 +158,7 @@ class IngestTimestampOutOfRange(TypedDict):
 
 CursorInitializationResult: TypeAlias = CursorInitialized | CursorInitializationStatus
 CursorSnapshot: TypeAlias = MissingCursor | StoredCursor
-AnyCursorSnapshot: TypeAlias = CursorSnapshot
+AnyCursorSnapshot: TypeAlias = CursorSnapshot | CICursorSnapshot
 IngestResult: TypeAlias = (
     IngestStored | IngestDuplicate | IngestStale | IngestWrongType
     | IngestInvalidState | IngestTimestampOutOfRange
@@ -681,6 +691,29 @@ class TaskStore:
         snapshot = self._read_task_snapshot(task_id)
         return None if snapshot is None else snapshot[1]
 
+    def load_occurrence(self, occurrence_id: str) -> dict[str, object] | None:
+        """Read an immutable occurrence document for tests and local inspection."""
+        key = occurrence_key(occurrence_id)
+        key_type = self._text(self._client.type(key))
+        if key_type == "none":
+            return None
+        if key_type != "string":
+            raise TaskStoreError("occurrence_wrong_type")
+        raw = self._client.get(key)
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            raise TaskStoreError("occurrence_invalid_json") from None
+        if isinstance(value, dict) and isinstance(value.get("kind"), str) and value["kind"].startswith("ci_"):
+            result = validate_ci_event(value)
+            if result["status"] != "valid":
+                raise TaskStoreError("occurrence_invalid_state")
+            return cast(dict[str, object], result["value"])
+        result = validate_stored_event(value)
+        if result["status"] != "valid":
+            raise TaskStoreError("occurrence_invalid_state")
+        return cast(dict[str, object], result["value"])
+
     def observation_ids(self, task_id: str) -> list[str]:
         """Return retained occurrence IDs for an incident task."""
         key = observations_key(task_id)
@@ -746,6 +779,99 @@ class TaskStore:
             raise TaskStoreError("incident_mismatch")
         return self._ingest_registered_failure(
             CURSOR_KEY, self._expected(expected), cursor, event, identity, advance=True,
+        )
+
+    def read_ci_cursor(self, source_repo: str) -> CICursorSnapshot:
+        """Read this repository's independent, strictly validated full-history cursor."""
+        key = ci_cursor_key(source_repo)
+        key_type = self._text(self._client.type(key))
+        if key_type == "none":
+            return {"status": "missing"}
+        if key_type != "string":
+            raise TaskStoreError("ci_cursor_wrong_type")
+        raw = self._client.get(key)
+        if not isinstance(raw, str):
+            raise TaskStoreError("ci_cursor_unreadable")
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            raise TaskStoreError("ci_cursor_invalid_json") from None
+        result = validate_ci_cursor(value, source_repo)
+        if result["status"] != "valid":
+            raise TaskStoreError("ci_cursor_invalid_state")
+        return {"status": "stored", "raw": raw, "value": result["value"]}
+
+    def initialize_ci_cursor(self, source_repo: str) -> CursorInitializationResult:
+        """Create page-one CI state once without touching the QA-file cursor."""
+        cursor = initial_ci_cursor(source_repo)
+        return self._initialize_cursor(ci_cursor_key(source_repo), stable_json(cursor))
+
+    def ingest_ci_observation(self, expected: CICursorSnapshot, occurrence: CIEvent) -> IngestResult:
+        """Persist one complete attempt without moving the pending repository page."""
+        event = self._require_ci_event(occurrence)
+        if event["kind"] != "ci_attempt":
+            raise TaskStoreError("ci_observation_kind")
+        cursor = initial_ci_cursor(event["source_repo"])
+        if expected["status"] == "stored":
+            cursor = expected["value"]
+        return self._ingest_observation(
+            ci_cursor_key(event["source_repo"]), self._expected(expected), cursor, event,
+            advance=False,
+        )
+
+    def ingest_ci_failure(
+        self, expected: CICursorSnapshot, occurrence: CIEvent, identity: IncidentIdentity,
+    ) -> IngestResult:
+        """Register failed attempts and monitor incidents without advancing page progress."""
+        event = self._require_ci_event(occurrence)
+        if event["kind"] not in ("ci_failure", "ci_monitor") or event["incident_id"] != identity["id"]:
+            raise TaskStoreError("incident_mismatch")
+        if event["source_repo"] != identity["source_repo"]:
+            raise TaskStoreError("incident_mismatch")
+        mode = event.get("mode", "unknown")
+        if identity["mode"] != mode:
+            raise TaskStoreError("incident_mismatch")
+        cursor = initial_ci_cursor(event["source_repo"])
+        if expected["status"] == "stored":
+            cursor = expected["value"]
+        return self._ingest_registered_failure(
+            ci_cursor_key(event["source_repo"]), self._expected(expected), cursor, event,
+            identity, advance=False,
+        )
+
+    def commit_ci_page(
+        self, expected: CICursorSnapshot, next_cursor: CICursor, occurrence: CIEvent,
+    ) -> IngestResult:
+        """Atomically save the page checkpoint before advancing only the matching CI cursor."""
+        event = self._require_ci_event(occurrence)
+        cursor_result = validate_ci_cursor(next_cursor, event["source_repo"])
+        if (
+            event["kind"] != "ci_page" or cursor_result["status"] != "valid"
+            or expected["status"] != "stored"
+        ):
+            raise TaskStoreError("ci_page_invalid")
+        current = expected["value"]
+        if (event["pass_id"], event["page"]) != (current["pass_id"], current["next_page"]):
+            raise TaskStoreError("ci_page_invalid")
+        if event["run_ids"]:
+            if current["next_page"] >= MAX_CI_PAGE:
+                raise TaskStoreError("ci_page_invalid")
+            expected_next: CICursor = {
+                "schema_version": 2, "source_repo": event["source_repo"],
+                "pass_id": current["pass_id"], "next_page": current["next_page"] + 1,
+                "previous_page_ids": event["run_ids"],
+            }
+        else:
+            expected_next = {
+                "schema_version": 2, "source_repo": event["source_repo"],
+                "pass_id": current["pass_id"] + 1, "next_page": 1,
+                "previous_page_ids": [],
+            }
+        if cursor_result["value"] != expected_next:
+            raise TaskStoreError("ci_page_invalid")
+        return self._ingest_observation(
+            ci_cursor_key(event["source_repo"]), self._expected(expected), cursor_result["value"],
+            event, advance=True,
         )
 
     def queued_ids(self) -> list[str]:
@@ -847,7 +973,7 @@ class TaskStore:
         self,
         cursor_key: str,
         expected: str,
-        next_cursor: Cursor,
+        next_cursor: Cursor | CICursor,
         event: dict[str, object],
         *,
         advance: bool,
@@ -863,7 +989,7 @@ class TaskStore:
         self,
         cursor_key: str,
         expected: str,
-        next_cursor: Cursor,
+        next_cursor: Cursor | CICursor,
         event: dict[str, object],
         identity: IncidentIdentity,
         *,
@@ -953,6 +1079,13 @@ class TaskStore:
         result: EventValidation = validate_stored_event(value)
         if result["status"] != "valid":
             raise TaskStoreError("invalid_occurrence")
+        return result["value"]
+
+    @staticmethod
+    def _require_ci_event(value: CIEvent) -> CIEvent:
+        result = validate_ci_event(value)
+        if result["status"] != "valid":
+            raise TaskStoreError("ci_occurrence_invalid")
         return result["value"]
 
     @staticmethod
