@@ -279,5 +279,50 @@ class CICollectorTests(unittest.TestCase):
         for truncated in (False, True):
             self.assertEqual(validate_text("diagnostic 😀", truncated)["status"], "valid")
 
+    def test_scenario_verdict_requires_complete_run_bound_producer_shape(self):
+        def diagnostic(value):
+            text = json.dumps(value)
+            return [{"job_id": 1, "sha256": hashlib.sha256(text.encode()).hexdigest(), "text": text, "truncated": False}]
+
+        valid = full_verdict(42)
+        self.assertEqual(scenario_mode(diagnostic(valid), 42), "sync")
+        invalid = (
+            {**valid, "runId": "43"},
+            {**valid, "status": "mislabelled"},
+            {**valid, "elapsedMs": True},
+            {**valid, "apiCalls": -1},
+            {**valid, "throttled429": "0"},
+            {**valid, "tab": 7},
+            {**valid, "extra": "not emitted by producer"},
+            {**valid, "steps": [{"name": "sync-boot", "status": "ok", "extra": 1}]},
+        )
+        misconfigured = full_verdict(42, status="misconfigured")
+        self.assertEqual(len(scenario_verdicts(diagnostic(misconfigured), 42)), 1)
+        self.assertEqual(scenario_mode(diagnostic(misconfigured), 42), "unknown")
+        for verdict in invalid:
+            with self.subTest(verdict=verdict):
+                self.assertEqual(scenario_mode(diagnostic(verdict), 42), "unknown")
+
+    def test_diagnostic_redaction_covers_prefixed_json_credentials_and_private_keys(self):
+        secrets = (
+            "fake-access-token-17", "fake-client-secret-22", "fake-prefixed-key-33",
+            "FAKE_MULTILINE_PRIVATE_KEY", "FAKE_ESCAPED_PRIVATE_KEY", "FAKE_PARTIAL_PRIVATE_KEY",
+        )
+        text = "\n".join((
+            json.dumps({
+                "access_token": secrets[0], "client_secret": secrets[1],
+                "GH_API_KEY": secrets[2], "id": 17, "count": 23,
+                "private_key": "-----BEGIN PRIVATE KEY-----\\nFAKE_ESCAPED_PRIVATE_KEY\\n-----END PRIVATE KEY-----",
+            }),
+            "-----BEGIN PRIVATE KEY-----\nFAKE_MULTILINE_PRIVATE_KEY\n-----END PRIVATE KEY-----",
+            "-----BEGIN PRIVATE KEY-----\nFAKE_PARTIAL_PRIVATE_KEY",
+        ))
+        clean = sanitize_diagnostic(text)
+        for secret in secrets:
+            self.assertNotIn(secret, clean)
+        self.assertIn('"id": 17', clean)
+        self.assertIn('"count": 23', clean)
+        self.assertEqual(sanitize_diagnostic(clean), clean)
+
 if __name__ == "__main__":
     unittest.main()

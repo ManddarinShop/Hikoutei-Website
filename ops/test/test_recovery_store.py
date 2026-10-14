@@ -13,15 +13,23 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 
 sys.path.insert(0, str(ROOT / "ops" / "worker"))
 
 import redis
+from ci_contracts import (
+    ci_cursor_key,
+    make_ci_attempt_event,
+    make_ci_failure_event,
+    make_ci_monitor_event,
+    make_ci_page_event,
+)
 from task_contracts import (
     Cursor, FailureOccurrence, MAX_SAFE_COUNTER, MAX_SAFE_TIMESTAMP_MS, classify_incident,
-    make_occurrence_id, stable_json, validate_qa_record, validate_task,
+    make_occurrence_id, stable_json, validate_qa_record, validate_stored_event, validate_task,
 )
 from task_store import (
     CURSOR_KEY, QUEUE_KEY, QUEUE_REGISTRY_KEY, TaskStore, TaskStoreError,
@@ -107,6 +115,26 @@ def make_failure_event(raw: bytes, *, mode: str = "unknown") -> tuple[FailureOcc
         "boot_context": {"status": "unknown"},
     }
     return event, identity, cursor
+
+
+def make_ci_failure(run_id: int):
+    run = {
+        "source_repo": SOURCE, "run_id": run_id, "run_attempt": 1,
+        "workflow_id": 12, "workflow_path": ".github/workflows/ci.yml",
+        "head_sha": "a" * 40, "head_ref": "main",
+        "status": "completed", "conclusion": "failure",
+    }
+    jobs = [{
+        "id": run_id + 100, "run_id": run_id, "run_attempt": 1,
+        "name": "test", "status": "completed", "conclusion": "failure",
+        "steps": [{"name": "Run tests", "status": "completed", "conclusion": "failure"}],
+    }]
+    text = f"unclassified failure {run_id}"
+    diagnostics = [{
+        "job_id": run_id + 100, "sha256": hashlib.sha256(text.encode()).hexdigest(),
+        "text": text, "truncated": False,
+    }]
+    return make_ci_failure_event(run, jobs, diagnostics)
 
 
 class InjectLuaFailure:
@@ -1513,6 +1541,213 @@ class RedisBackedRecoveryTests(unittest.TestCase):
                 {"partial archive failure"},
             )
             self.assertEqual((path.read_bytes(), archive.read_bytes()), (active_bytes, archive_bytes))
+
+    def test_sync_and_mismatched_seed_modes_are_not_inferred(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "qa-history.jsonl"
+            records = [
+                boot(1, "sync"),
+                failure("count drift at step 1: runtime=2 model=1", seed=1),
+                boot(2, "local"),
+                failure("count drift at step 2: runtime=3 model=2", seed=1),
+                {"type": "summary", "ts": TS, "seed": 3, "iterations": 1, "failures": 0,
+                 "uptimeS": 1, "opCounters": {name: {"total": 0, "ok": 0, "fail": 0} for name in (
+                     "create", "update", "delete", "duplicateInsert", "noOpUpdate", "deleteRecreate", "flushCycle")}},
+                failure("count drift at step 3: runtime=4 model=3", seed=2),
+            ]
+            path.write_bytes(b"".join(map(qa_line, records)))
+            self.assertEqual(tail_once(self.store, str(path)), len(records))
+        tasks = [self.store.load_task(task_id) for task_id in self.store.queued_ids()]
+        self.assertEqual({task["mode"] for task in tasks if task is not None}, {"sync", "unknown"})
+        events = [self.store.load_occurrence(key.rsplit(":", 1)[-1]) for key in self.redis.scan_iter("ops:v2:occurrence:*")]
+        failures = sorted(
+            (event for event in events if event and event.get("kind") == "failure"),
+            key=lambda event: event["offset"],
+        )
+        self.assertEqual([event["mode"] for event in failures], ["sync", "unknown", "unknown"])
+
+    def test_stored_boot_seed_is_bounded_on_validation_and_load(self) -> None:
+        valid = stored_boot_event(0xFFFFFFFF)
+        self.assertEqual(validate_stored_event(valid)["status"], "valid")
+        self.redis.set(occurrence_key(valid["occurrence_id"]), stable_json(valid))
+        self.assertEqual(self.store.load_occurrence(valid["occurrence_id"])["record"]["seed"], 0xFFFFFFFF)
+
+        for offset, seed in enumerate((0x100000000, True, -1), start=1):
+            event = stored_boot_event(seed, offset)
+            self.assertEqual(validate_stored_event(event)["status"], "invalid")
+            self.redis.set(occurrence_key(event["occurrence_id"]), stable_json(event))
+            with self.assertRaisesRegex(TaskStoreError, "occurrence_invalid_state"):
+                self.store.load_occurrence(event["occurrence_id"])
+
+    def test_ci_cursor_and_failure_ingress_are_independent_of_qa_file_state(self) -> None:
+        event, identity = make_ci_failure(37607928772)
+        self.assertEqual(self.store.read_cursor(), {"status": "missing"})
+        self.assertEqual(self.store.initialize_ci_cursor(SOURCE), {"status": "stored"})
+        expected = self.store.read_ci_cursor(SOURCE)
+        self.assertEqual(expected["status"], "stored")
+        assert expected["status"] == "stored"
+        before = expected["raw"]
+
+        self.assertEqual(self.store.ingest_ci_failure(expected, event, identity), {"status": "stored"})
+        self.assertEqual(self.store.read_ci_cursor(SOURCE)["raw"], before)
+        self.assertEqual(self.store.read_cursor(), {"status": "missing"})
+        loaded = self.store.load_occurrence(event["occurrence_id"])
+        self.assertEqual(loaded, event)
+        task = self.store.load_task(identity["id"])
+        self.assertEqual(task["status"], "queued")
+        self.assertEqual(self.store.queued_ids(), [identity["id"]])
+        self.assertEqual(self.redis.xlen(QUEUE_KEY), 1)
+        self.assertEqual(self.store.observation_ids(identity["id"]), [event["occurrence_id"]])
+
+    def test_ci_monitor_incidents_share_the_registered_queue_and_keep_page_pending(self) -> None:
+        event, identity = make_ci_monitor_event(SOURCE, 0, 1, "github_forbidden")
+        self.store.initialize_ci_cursor(SOURCE)
+        expected = self.store.read_ci_cursor(SOURCE)
+        assert expected["status"] == "stored"
+
+        self.assertEqual(self.store.ingest_ci_failure(expected, event, identity), {"status": "stored"})
+        self.assertEqual(self.store.ingest_ci_failure(expected, event, identity), {"status": "duplicate"})
+        self.assertEqual(self.store.read_ci_cursor(SOURCE)["raw"], expected["raw"])
+        self.assertEqual(self.store.load_occurrence(event["occurrence_id"]), event)
+        self.assertEqual(self.store.queued_ids(), [identity["id"]])
+        self.assertEqual(self.redis.xlen(QUEUE_KEY), 1)
+
+    def test_ci_failure_partial_registration_replays_without_advancing_cursor(self) -> None:
+        event, identity = make_ci_failure(37607928773)
+        self.store.initialize_ci_cursor(SOURCE)
+        expected = self.store.read_ci_cursor(SOURCE)
+        assert expected["status"] == "stored"
+        before = expected["raw"]
+        failing = TaskStore(InjectLuaFailure(self.redis, "observation_index"))
+
+        with self.assertRaises(redis.ResponseError):
+            failing.ingest_ci_failure(expected, event, identity)
+
+        self.assertEqual(failing.read_ci_cursor(SOURCE)["raw"], before)
+        self.assertEqual(failing.load_occurrence(event["occurrence_id"]), event)
+        self.assertIsNone(failing.load_task(identity["id"]))
+        self.assertEqual(self.redis.hget(QUEUE_REGISTRY_KEY, identity["id"]), self.redis.xrange(QUEUE_KEY)[0][0])
+        self.assertEqual(
+            self.store.ingest_ci_failure(expected, event, identity), {"status": "duplicate"},
+        )
+        self.assertEqual(self.store.read_ci_cursor(SOURCE)["raw"], before)
+        self.assertIsNotNone(self.store.load_task(identity["id"]))
+        self.assertEqual(self.redis.xlen(QUEUE_KEY), 1)
+
+    def test_ci_observation_is_immutable_and_does_not_advance_page_cursor(self) -> None:
+        run = {
+            "source_repo": SOURCE, "run_id": 37607928775, "run_attempt": 1,
+            "workflow_id": 12, "workflow_path": ".github/workflows/ci.yml",
+            "head_sha": "b" * 40, "head_ref": "develop",
+            "status": "completed", "conclusion": "success",
+        }
+        event = make_ci_attempt_event(run, [])
+        self.store.initialize_ci_cursor(SOURCE)
+        expected = self.store.read_ci_cursor(SOURCE)
+        assert expected["status"] == "stored"
+        before = expected["raw"]
+
+        self.assertEqual(self.store.ingest_ci_observation(expected, event), {"status": "stored"})
+        self.assertEqual(self.store.ingest_ci_observation(expected, event), {"status": "duplicate"})
+        self.assertEqual(self.store.read_ci_cursor(SOURCE)["raw"], before)
+        self.assertEqual(self.store.load_occurrence(event["occurrence_id"]), event)
+
+        malformed = {**event, "run": {**run, "head_ref": ""}}
+        self.redis.set(occurrence_key(event["occurrence_id"]), stable_json(malformed))
+        with self.assertRaisesRegex(TaskStoreError, "occurrence_invalid_state"):
+            self.store.load_occurrence(event["occurrence_id"])
+
+    def test_ci_page_checkpoint_uses_payload_identity_and_cursor_cas(self) -> None:
+        repo = SOURCE
+        self.store.initialize_ci_cursor(repo)
+        expected = self.store.read_ci_cursor(repo)
+        assert expected["status"] == "stored"
+        digest = hashlib.sha256(b"page-one").hexdigest()
+        page = make_ci_page_event(repo, 0, 1, digest, [91])
+        invalid_next_cursor = {
+            "schema_version": 2, "source_repo": repo, "pass_id": 0,
+            "next_page": 3, "previous_page_ids": [91],
+        }
+        with self.assertRaisesRegex(TaskStoreError, "ci_page_invalid"):
+            self.store.commit_ci_page(expected, invalid_next_cursor, page)
+        self.assertEqual(self.store.read_ci_cursor(repo)["raw"], expected["raw"])
+        next_cursor = {
+            "schema_version": 2, "source_repo": repo, "pass_id": 0,
+            "next_page": 2, "previous_page_ids": [91],
+        }
+
+        self.assertEqual(self.store.commit_ci_page(expected, next_cursor, page), {"status": "stored"})
+        cursor = self.store.read_ci_cursor(repo)
+        self.assertEqual(cursor["value"], next_cursor)
+        self.assertEqual(self.store.load_occurrence(page["occurrence_id"]), page)
+
+        later = make_ci_page_event(repo, 0, 1, hashlib.sha256(b"different-page").hexdigest(), [92])
+        later_next_cursor = {**next_cursor, "previous_page_ids": [92]}
+        self.assertEqual(self.store.commit_ci_page(expected, later_next_cursor, later), {"status": "stale_cursor"})
+        self.assertIsNone(self.store.load_occurrence(later["occurrence_id"]))
+        self.assertEqual(self.store.read_cursor(), {"status": "missing"})
+
+    def test_ci_ingress_wrong_types_fail_before_writes_and_preserve_qa_cursor(self) -> None:
+        event, identity = make_ci_failure(37607928774)
+        qa_sentinel = stable_json(initial_cursor(44, 55))
+        self.redis.set(CURSOR_KEY, qa_sentinel)
+        self.store.initialize_ci_cursor(SOURCE)
+        expected = self.store.read_ci_cursor(SOURCE)
+        assert expected["status"] == "stored"
+        ci_key = ci_cursor_key(SOURCE)
+
+        self.redis.set(QUEUE_KEY, "wrong-queue-type")
+        before_cursor = self.redis.get(ci_key)
+        result = self.store.ingest_ci_failure(expected, event, identity)
+        self.assertEqual(result, {"status": "wrong_type", "key_role": "queue"})
+        self.assertIsNone(self.redis.get(occurrence_key(event["occurrence_id"])))
+        self.assertIsNone(self.redis.get(task_key(identity["id"])))
+        self.assertEqual(self.redis.get(ci_key), before_cursor)
+        self.assertEqual(self.redis.get(CURSOR_KEY), qa_sentinel)
+
+        self.redis.delete(QUEUE_KEY)
+        self.redis.delete(ci_key)
+        self.redis.lpush(ci_key, "wrong-ci-cursor-type")
+        result = self.store.ingest_ci_failure({"status": "missing"}, event, identity)
+        self.assertEqual(result, {"status": "wrong_type", "key_role": "cursor"})
+        self.assertIsNone(self.redis.get(occurrence_key(event["occurrence_id"])))
+        self.assertIsNone(self.redis.get(task_key(identity["id"])))
+        self.assertEqual(self.redis.get(CURSOR_KEY), qa_sentinel)
+
+    def test_stale_cursor_cannot_advance_or_write_late_occurrence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "qa-history.jsonl"
+            path.write_bytes(qa_line(boot(20)))
+            self.assertEqual(tail_once(self.store, str(path)), 1)
+        old = self.store.read_cursor()
+        assert old["status"] == "stored"
+        file = old["value"]["file"]
+        assert file["status"] == "bound"
+        raw1 = qa_line({"type": "summary", "ts": TS, "seed": 20, "iterations": 0, "failures": 0,
+                        "uptimeS": 0, "opCounters": {name: {"total": 0, "ok": 0, "fail": 0} for name in (
+                            "create", "update", "delete", "duplicateInsert", "noOpUpdate", "deleteRecreate", "flushCycle")}})
+        event_id1 = make_occurrence_id(SOURCE, file["device"], file["inode"], 0, old["value"]["offset"], hashlib.sha256(raw1).hexdigest())
+        event_id2 = make_occurrence_id(SOURCE, file["device"], file["inode"], 0, old["value"]["offset"] + 1, hashlib.sha256(raw1).hexdigest())
+        record = validate_qa_record(json.loads(raw1))
+        assert record["status"] == "valid"
+        base: dict[str, Any] = {
+            "schema_version": 2,
+            "source_repo": SOURCE,
+            "generation": 0,
+            "file": file,
+            "raw_sha256": hashlib.sha256(raw1).hexdigest(),
+            "kind": "summary",
+            "record": record["value"],
+        }
+        cursor1: Cursor = {**old["value"], "offset": old["value"]["offset"] + len(raw1)}
+        cursor1["boundary_sha256"] = hashlib.sha256(raw1[-128:]).hexdigest()
+        cursor2: Cursor = {**cursor1, "offset": cursor1["offset"] + 1}
+        event1 = {**base, "occurrence_id": event_id1, "offset": old["value"]["offset"]}
+        event2 = {**base, "occurrence_id": event_id2, "offset": old["value"]["offset"] + 1}
+        self.assertEqual(self.store.ingest_observation(old, cursor1, event1)["status"], "stored")
+        self.assertEqual(self.store.ingest_observation(old, cursor2, event2)["status"], "stale_cursor")
+        self.assertIsNone(self.store.load_occurrence(event_id2))
+        self.assertEqual(self.store.read_cursor()["raw"], json.dumps(cursor1, sort_keys=True, separators=(",", ":")))
 
 class StoreKeyBoundaryTests(unittest.TestCase):
     def test_observations_key_preserves_valid_task_key(self):
