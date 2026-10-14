@@ -1,4 +1,6 @@
 """Focused tests for the bounded CI provider contracts."""
+import hashlib
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -8,9 +10,14 @@ sys.path.insert(0, str(ROOT / "ops" / "worker"))
 
 from ci_contracts import (  # noqa: E402
     initial_ci_cursor,
+    make_ci_failure_event,
     normalize_job,
     normalize_run,
+    sanitize_diagnostic,
+    scenario_mode,
+    scenario_verdicts,
     validate_ci_cursor,
+    validate_ci_event,
 )
 
 LIBRARY = "ManddarinShop/Hikoutei"
@@ -56,6 +63,26 @@ def job_row(repo, run, job_id, *, conclusion="success", name="test", steps=None)
         "status": "completed",
         "conclusion": conclusion,
         "steps": steps or [{"name": "Run", "status": "completed", "conclusion": conclusion}],
+    }
+
+
+def full_verdict(run_id, *, status="failed", tab="QARecord_Input", steps=None):
+    return {
+        "status": status,
+        "runId": str(run_id),
+        "tab": tab,
+        "elapsedMs": 318883,
+        "apiCalls": 4,
+        "throttled429": 0,
+        "steps": steps or [
+            {"name": "auth", "status": "ok"},
+            {"name": "discover-tab", "status": "ok", "detail": "QARecord_Input"},
+            {"name": "read-headers", "status": "ok", "detail": "6 columns"},
+            {"name": "append-canary", "status": "ok", "detail": "6 cells"},
+            {"name": "sync-boot", "status": "ok"},
+            {"name": "ingest-poll", "status": "failed", "detail": "ingest-timeout"},
+            {"name": "cleanup", "status": "ok"},
+        ],
     }
 
 
@@ -107,6 +134,150 @@ class CICollectorTests(unittest.TestCase):
         self.assertIsNone(normalize_job({**job, "steps": [{"name": "Run", "status": "in_progress", "conclusion": "success"}]}, run))
         self.assertIsNone(normalize_job({**job, "status": "in_progress", "conclusion": "success"}, run))
 
+
+    def test_scenario_json_duplicate_keys_never_classify(self):
+        valid = json.dumps(full_verdict(42))
+        duplicate_run = valid.replace('"runId": "42"', '"runId": "41", "runId": "42"')
+        duplicate_status = valid.replace('"status": "failed"', '"status": "misconfigured", "status": "failed"', 1)
+        duplicate_step = valid.replace(
+            '"name": "auth", "status": "ok"',
+            '"name": "auth", "status": "failed", "status": "ok"',
+        )
+        legacy_minimal = '{"status":"failed","runId":"42","runId":"42","steps":[{"name":"sync-boot","status":"ok"}]}'
+        for text in (duplicate_run, duplicate_status, duplicate_step, legacy_minimal):
+            with self.subTest(text=text):
+                diagnostics = [{"job_id": 1, "sha256": hashlib.sha256(text.encode()).hexdigest(), "text": text, "truncated": False}]
+                self.assertEqual(scenario_verdicts(diagnostics, 42), [])
+                self.assertEqual(scenario_mode(diagnostics, 42), "unknown")
+
+    def test_diagnostic_redaction_decodes_json_uri_string_tokens(self):
+        cases = (
+            r'{"database_url":"postgres:\/\/user:fake-db-sensitive-17@example.invalid/app","id":17,"step":"keep exactly"}',
+            r'{"database_url":"postgres:\u002f\u002fuser:fake-db-sensitive-17@example.invalid/app","id":17,"step":"keep exactly"}',
+            r'{"database_url":"postgr\u0065s:\u002f\u002fuser:fake-db-sensitive-17@example.invalid/app","id":17,"step":"keep exactly"}',
+        )
+        expected = '{"database_url":"[redacted-url]","id":17,"step":"keep exactly"}'
+        for text in cases:
+            with self.subTest(text=text):
+                clean = sanitize_diagnostic(text)
+                self.assertEqual(clean, expected)
+                self.assertEqual(json.loads(clean), {
+                    "database_url": "[redacted-url]", "id": 17, "step": "keep exactly",
+                })
+                self.assertEqual(sanitize_diagnostic(clean), clean)
+                self.assertNotIn("fake-db-sensitive-17", clean)
+
+        encoded_uri_key = r'{"postgres:\u002f\u002fuser:fake-key-secret@example.invalid/db":"keep","step":17}'
+        clean_key = sanitize_diagnostic(encoded_uri_key)
+        self.assertEqual(clean_key, '{"[redacted-url]":"keep","step":17}')
+        self.assertEqual(json.loads(clean_key), {"[redacted-url]": "keep", "step": 17})
+        self.assertEqual(sanitize_diagnostic(clean_key), clean_key)
+        self.assertNotIn("fake-key-secret", clean_key)
+
+    def test_diagnostic_redaction_decodes_escaped_credentials_and_preserves_safe_json(self):
+        fake_pat = "ghp_" + "A" * 24
+        fake_ci_token = "fake-ci-secret-57"
+        cases = (
+            (r'{"message":"\u0067hp_' + "A" * 24 + r'","count":17,"plain":"keep exactly"}', fake_pat, ""),
+            (r'{"message":"\u0042earer fake-bearer-value-71","count":17,"plain":"keep exactly"}', "fake-bearer-value-71", ""),
+            (r'{"message":"\u0066ake-ci-secret-57","count":17,"plain":"keep exactly"}', fake_ci_token, fake_ci_token),
+            (r'{"message":"\u002d\u002d\u002d\u002d\u002dBEGIN PRIVATE KEY\u002d\u002d\u002d\u002d\u002d\nFAKE_ESCAPED_PRIVATE_KEY\n\u002d\u002d\u002d\u002d\u002dEND PRIVATE KEY\u002d\u002d\u002d\u002d\u002d","count":17,"plain":"keep exactly"}', "FAKE_ESCAPED_PRIVATE_KEY", ""),
+        )
+        for text, secret, token in cases:
+            with self.subTest(secret=secret[:12]):
+                clean = sanitize_diagnostic(text, token)
+                decoded = json.loads(clean)
+                self.assertNotIn(secret, json.dumps(decoded))
+                self.assertEqual((decoded["count"], decoded["plain"]), (17, "keep exactly"))
+                self.assertEqual(sanitize_diagnostic(clean, token), clean)
+
+        compound_pat = "ghp_" + "C" * 24
+        compound_text = (
+            r'{"api_key_\u0067hp_' + "C" * 24
+            + r'":"fake-field-value-79","count":17,"plain":"keep exactly"}'
+        )
+        compound_clean = sanitize_diagnostic(compound_text)
+        compound_decoded = json.loads(compound_clean)
+        compound_json = json.dumps(compound_decoded)
+        self.assertNotIn(compound_pat, compound_json)
+        self.assertNotIn("fake-field-value-79", compound_json)
+        self.assertEqual(compound_decoded, {
+            "api_key_[redacted]": "[redacted]",
+            "count": 17,
+            "plain": "keep exactly",
+        })
+        self.assertEqual(sanitize_diagnostic(compound_clean), compound_clean)
+
+        key_secret = "ghp_" + "B" * 24
+        encoded_key = r'{"\u0067hp_' + "B" * 24 + r'":"keep exactly","count":17}'
+        clean_key = sanitize_diagnostic(encoded_key)
+        self.assertEqual(json.loads(clean_key), {"[redacted]": "keep exactly", "count": 17})
+        self.assertNotIn(key_secret, clean_key)
+        self.assertEqual(sanitize_diagnostic(clean_key), clean_key)
+
+        bearer_key_secret = "fake-bearer-key-73"
+        bearer_key_cases = (
+            r'{"Bearer fake-bearer-key-73":"keep exactly","count":17}',
+            r'{"\u0042earer fake-bearer-key-73":"keep exactly","count":17}',
+        )
+        for text in bearer_key_cases:
+            with self.subTest(bearer_key=text):
+                clean_bearer_key = sanitize_diagnostic(text)
+                self.assertEqual(json.loads(clean_bearer_key), {
+                    "Bearer [redacted]": "keep exactly", "count": 17,
+                })
+                self.assertNotIn(bearer_key_secret, clean_bearer_key)
+                self.assertEqual(sanitize_diagnostic(clean_bearer_key), clean_bearer_key)
+
+        encoded_secret_key = r'{"api_\u006bey":"fake-field-secret-73","co\u0075nt":17}'
+        clean_secret_key = sanitize_diagnostic(encoded_secret_key)
+        self.assertEqual(clean_secret_key, r'{"api_key":"[redacted]","co\u0075nt":17}')
+        self.assertEqual(sanitize_diagnostic(clean_secret_key), clean_secret_key)
+
+    def test_ci_event_rejects_escaped_pat_and_accepts_rehashed_sanitized_evidence(self):
+        raw_run = run_row(WEBSITE, 42, conclusion="failure")
+        run = normalize_run(raw_run, WEBSITE)
+        job = normalize_job(job_row(WEBSITE, raw_run, 7, conclusion="failure"), run)
+        escaped_pat = r'{"message":"\u0067hp_' + "A" * 24 + '"}'
+
+        def diagnostic(text):
+            return {
+                "job_id": job["id"],
+                "sha256": hashlib.sha256(text.encode()).hexdigest(),
+                "text": text,
+                "truncated": False,
+            }
+
+        def event_status(text):
+            event, _identity = make_ci_failure_event(run, [job], [diagnostic(text)])
+            return validate_ci_event(event)["status"]
+
+        self.assertEqual(event_status(escaped_pat), "invalid")
+        self.assertEqual(event_status(sanitize_diagnostic(escaped_pat)), "valid")
+        escaped_key = r'{"api_\u006bey":"fake-field-secret-73","count":17}'
+        self.assertEqual(event_status(escaped_key), "invalid")
+        self.assertEqual(event_status(sanitize_diagnostic(escaped_key)), "valid")
+
+    def test_ci_diagnostic_unicode_must_encode_as_utf8(self):
+        raw_run = run_row(WEBSITE, 42, conclusion="failure")
+        run = normalize_run(raw_run, WEBSITE)
+        job = normalize_job(job_row(WEBSITE, raw_run, 7, conclusion="failure"), run)
+
+        def validate_text(text, truncated):
+            try:
+                digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            except UnicodeEncodeError:
+                digest = "0" * 64
+            diagnostic = {"job_id": 7, "sha256": digest, "text": text, "truncated": truncated}
+            return validate_ci_event(make_ci_failure_event(run, [job], [diagnostic])[0])
+
+        invalid = {"status": "invalid", "code": "ci_diagnostic_fields"}
+        for text in (json.loads('"\\ud800"'), json.loads('"\\udfff"')):
+            for truncated in (False, True):
+                with self.subTest(text=repr(text), truncated=truncated):
+                    self.assertEqual(validate_text(text, truncated), invalid)
+        for truncated in (False, True):
+            self.assertEqual(validate_text("diagnostic 😀", truncated)["status"], "valid")
 
 if __name__ == "__main__":
     unittest.main()
